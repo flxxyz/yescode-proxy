@@ -1,0 +1,18 @@
+[Unit]
+Description=yescode-proxy (OpenClaw <-> yes.vg passthrough)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/yescode-proxy
+EnvironmentFile=%h/workspace/yescode-proxy/.env
+ExecStart=%h/.nvm/versions/node/v24.14.0/bin/node server.js
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+StandardOutput=append:%h/.local/state/yescode-proxy.log
+StandardError=append:%h/.local/state/yescode-proxy.log
+
+[Install]
+WantedBy=default.target
