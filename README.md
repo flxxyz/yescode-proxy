@@ -39,6 +39,23 @@ YESCODE_API_KEY=team-xxxxxxxx ./install.sh
 
 **macOS 提示**：默认不配置日志轮转。需要的话装 `logrotate`（`brew install logrotate`）或配置 `newsyslog`。
 
+## 卸载
+
+安装出问题或不再需要时：
+
+```bash
+./uninstall.sh
+```
+
+默认保留 `.env`（含 API key）和日志文件。要一并删除：
+
+- `--purge-logs` —— 同时删除当前日志和已轮转归档
+- `--purge-env` —— 同时删除 `.env`（**注意：含 `YESCODE_API_KEY`**）
+- `--purge` —— 等同 `--purge-logs --purge-env`
+- `-y` —— 跳过确认提示
+
+脚本不会动源码目录，需要时自行 `rm -rf`。
+
 ## 部署（systemd 用户级服务）
 
 以 **用户级** systemd service 形态运行。已开启 user-linger，可在登出 / 重启后存活。

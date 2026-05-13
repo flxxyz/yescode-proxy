@@ -39,6 +39,23 @@ The script is **idempotent** — re-running regenerates the unit and restarts. R
 
 **macOS note:** log rotation is not configured by default. Install `logrotate` (`brew install logrotate`) or configure `newsyslog` if you need it.
 
+## Uninstall
+
+If install failed, or you just want to tear it down:
+
+```bash
+./uninstall.sh
+```
+
+By default keeps `.env` (your API key) and log files. To wipe them too:
+
+- `--purge-logs` — also delete the current log + rotated archives
+- `--purge-env` — also delete `.env` (**warning: contains `YESCODE_API_KEY`**)
+- `--purge` — shorthand for `--purge-logs --purge-env`
+- `-y` — skip the confirmation prompt
+
+The script does not touch the source tree — `rm -rf` it yourself if you want.
+
 ## Deployment (systemd user service)
 
 Installed as a **user-level** systemd service. User-linger is enabled, so it survives logout and reboot.
