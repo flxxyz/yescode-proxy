@@ -4,6 +4,39 @@ HTTP reverse proxy fronting **co.yes.vg** (YesCode) for OpenClaw. Handles three 
 
 Listens on `127.0.0.1:18790` by default. Single-file ESM script, no runtime deps.
 
+## Install
+
+One-shot installer for macOS (launchd) and systemd-based Linux (Ubuntu/Debian/Fedora/Arch/openSUSE/RHEL …):
+
+```bash
+git clone <this-repo> ~/yescode-proxy && cd ~/yescode-proxy
+./install.sh
+```
+
+Optional env vars:
+
+- `INSTALL_DIR=/path/to/dir` — install source elsewhere (default: script's own directory; the service points back at this path).
+- `YESCODE_API_KEY=team-...` — auto-populates `.env` if currently empty.
+
+```bash
+YESCODE_API_KEY=team-xxxxxxxx ./install.sh
+```
+
+What it does:
+
+1. Verifies Node.js ≥ 18 on PATH.
+2. Copies `.env.example` → `.env` (chmod 600) if missing; fills in `YESCODE_API_KEY` from env when supplied.
+3. Generates and installs the supervisor unit with absolute paths to your `node` binary and source dir:
+   - Linux → `~/.config/systemd/user/yescode-proxy.service` + (if `logrotate` is installed) the logrotate timer/service.
+   - macOS → `~/Library/LaunchAgents/com.openclaw.yescode-proxy.plist`.
+4. Starts the service and polls `/health` until it responds (up to 10s).
+
+The script is **idempotent** — re-running regenerates the unit and restarts. Re-run after moving the source dir or upgrading Node so paths get refreshed.
+
+**Linux note:** to keep the service running after logout, run `sudo loginctl enable-linger $USER` once. The installer prints a warning if linger is off.
+
+**macOS note:** log rotation is not configured by default. Install `logrotate` (`brew install logrotate`) or configure `newsyslog` if you need it.
+
 ## Deployment (systemd user service)
 
 Installed as a **user-level** systemd service. User-linger is enabled, so it survives logout and reboot.
