@@ -1,154 +1,156 @@
+[English](README.en.md) | 中文
+
 # yescode-proxy
 
-HTTP reverse proxy fronting **co.yes.vg** (YesCode) for OpenClaw. Handles three routes — `/v1/messages` (Anthropic), `/v1/*` (OpenAI), `/gemini/*` (Google) — strips client-supplied auth, injects the configured YesCode key, and (for Anthropic) rewrites the `metadata.user_id` + headers to pass YesCode's Claude-CLI fingerprint gate. Falls back from `co.yes.vg` to `co-cdn.yes.vg` on transient errors.
+为 OpenClaw 反向代理 **co.yes.vg**（YesCode）的 HTTP 服务。处理三类路由 —— `/v1/messages`（Anthropic）、`/v1/*`（OpenAI）、`/gemini/*`（Google）—— 剥除客户端自带的鉴权、注入配置好的 YesCode key；对 Anthropic 路由会改写 `metadata.user_id` 和请求头以通过 YesCode 的 Claude-CLI 指纹校验。遇到瞬时错误时从 `co.yes.vg` 自动回落到 `co-cdn.yes.vg`。
 
-Listens on `127.0.0.1:18790` by default. Single-file ESM script, no runtime deps.
+默认监听 `127.0.0.1:18790`。单文件 ESM 脚本，无运行时依赖。
 
-## Install
+## 安装
 
-One-shot installer for macOS (launchd) and systemd-based Linux (Ubuntu/Debian/Fedora/Arch/openSUSE/RHEL …):
+macOS（launchd）和 systemd 系 Linux（Ubuntu/Debian/Fedora/Arch/openSUSE/RHEL …）的一键安装脚本：
 
 ```bash
 git clone <this-repo> ~/yescode-proxy && cd ~/yescode-proxy
 ./install.sh
 ```
 
-Optional env vars:
+可选环境变量：
 
-- `INSTALL_DIR=/path/to/dir` — install source elsewhere (default: script's own directory; the service points back at this path).
-- `YESCODE_API_KEY=team-...` — auto-populates `.env` if currently empty.
+- `INSTALL_DIR=/path/to/dir` —— 把源码装到别的目录（默认是脚本自身所在目录，service 会指向这个路径）。
+- `YESCODE_API_KEY=team-...` —— 当 `.env` 当前为空时自动填入。
 
 ```bash
 YESCODE_API_KEY=team-xxxxxxxx ./install.sh
 ```
 
-What it does:
+脚本做的事：
 
-1. Verifies Node.js ≥ 18 on PATH.
-2. Copies `.env.example` → `.env` (chmod 600) if missing; fills in `YESCODE_API_KEY` from env when supplied.
-3. Generates and installs the supervisor unit with absolute paths to your `node` binary and source dir:
-   - Linux → `~/.config/systemd/user/yescode-proxy.service` + (if `logrotate` is installed) the logrotate timer/service.
-   - macOS → `~/Library/LaunchAgents/com.openclaw.yescode-proxy.plist`.
-4. Starts the service and polls `/health` until it responds (up to 10s).
+1. 检查 PATH 中存在 Node.js ≥ 18。
+2. 若没有 `.env`，从 `.env.example` 复制一份（chmod 600）；当提供了环境变量时填入 `YESCODE_API_KEY`。
+3. 生成并安装 supervisor unit，使用 `node` 二进制和源码目录的绝对路径：
+   - Linux → `~/.config/systemd/user/yescode-proxy.service` +（若装了 `logrotate`）logrotate timer/service。
+   - macOS → `~/Library/LaunchAgents/com.openclaw.yescode-proxy.plist`。
+4. 启动服务并轮询 `/health` 直到响应（最多 10 秒）。
 
-The script is **idempotent** — re-running regenerates the unit and restarts. Re-run after moving the source dir or upgrading Node so paths get refreshed.
+脚本是 **幂等** 的 —— 重复执行会重新生成 unit 并重启。移动源码目录或升级 Node 后再跑一次，路径就刷新了。
 
-**Linux note:** to keep the service running after logout, run `sudo loginctl enable-linger $USER` once. The installer prints a warning if linger is off.
+**Linux 提示**：登出后想让服务继续运行，执行一次 `sudo loginctl enable-linger $USER`。若未开启 linger，安装器会输出警告。
 
-**macOS note:** log rotation is not configured by default. Install `logrotate` (`brew install logrotate`) or configure `newsyslog` if you need it.
+**macOS 提示**：默认不配置日志轮转。需要的话装 `logrotate`（`brew install logrotate`）或配置 `newsyslog`。
 
-## Deployment (systemd user service)
+## 部署（systemd 用户级服务）
 
-Installed as a **user-level** systemd service. User-linger is enabled, so it survives logout and reboot.
+以 **用户级** systemd service 形态运行。已开启 user-linger，可在登出 / 重启后存活。
 
-| Path | Role |
+| 路径 | 用途 |
 |---|---|
-| `~/workspace/yescode-proxy/server.js` | source |
-| `~/workspace/yescode-proxy/.env` | runtime config (see [Configuration](#configuration)) |
-| `~/workspace/yescode-proxy/yescode-proxy.service` | upstream copy of the unit |
-| `~/.config/systemd/user/yescode-proxy.service` | installed unit (`cp` from above, then `daemon-reload`) |
-| `~/.local/state/yescode-proxy.log` | log output (file append + journal) |
+| `~/workspace/yescode-proxy/server.js` | 源码 |
+| `~/workspace/yescode-proxy/.env` | 运行时配置（见 [配置](#配置)） |
+| `~/workspace/yescode-proxy/yescode-proxy.service` | unit 的上游副本 |
+| `~/.config/systemd/user/yescode-proxy.service` | 已安装的 unit（从上面 `cp` 而来，然后 `daemon-reload`） |
+| `~/.local/state/yescode-proxy.log` | 日志输出（追加写文件 + journal） |
 
-Key unit fields:
+关键 unit 字段：
 
 - `WorkingDirectory=%h/workspace/yescode-proxy`
 - `EnvironmentFile=%h/workspace/yescode-proxy/.env`
 - `ExecStart=%h/.nvm/versions/node/v24.14.0/bin/node server.js`
-- `ExecReload=/bin/kill -HUP $MAINPID` — drives the [hot-reload](#hot-reload).
+- `ExecReload=/bin/kill -HUP $MAINPID` —— 驱动 [热重载](#热重载)。
 - `Restart=on-failure`
 
-## Hot-reload
+## 热重载
 
-Edits to `.env` apply **without restarting the process** (in-flight requests / SSE streams are preserved). Two triggers, both installed:
+修改 `.env` 后可 **无需重启进程** 即刻生效（正在处理的请求 / SSE 流不受影响）。两种触发方式，都已经装好：
 
-1. **SIGHUP** — `systemctl --user reload yescode-proxy` or `kill -HUP <pid>`.
-2. **fs.watchFile** on `.env` — 1s poll, 200ms debounce. Save the file in any editor and the change applies in ~1s.
+1. **SIGHUP** —— `systemctl --user reload yescode-proxy` 或 `kill -HUP <pid>`。
+2. **fs.watchFile** 监视 `.env` —— 1 秒轮询，200 毫秒去抖。在任意编辑器里保存文件，约 1 秒后生效。
 
-Reload reads `.env`, rebuilds the in-memory config object, logs a diff (`logBodies: true → false`, API keys masked). Per-request code paths read the live config object, so the next request sees the new value.
+热重载会读取 `.env`、重建内存中的配置对象、打印 diff（如 `logBodies: true → false`，API key 被遮蔽）。请求处理路径读的是实时配置对象，下一个请求即可看到新值。
 
-**Exceptions** — these require a full restart, reload only logs a warning and ignores the change:
+**例外** —— 这些字段需要完整重启，热重载只会打印警告并忽略改动：
 
-- `PORT`, `BIND` — bound to the listen socket at boot.
+- `PORT`、`BIND` —— 启动时绑定到监听 socket。
 
-**Stable across reloads** — when the env var is empty, these stay at their boot-time value to avoid shuffling the device fingerprint:
+**跨重载保持稳定** —— 当对应的环境变量为空时，这些字段保持启动时的值，避免设备指纹变动：
 
-- `YESCODE_REMOTE_CONTAINER_ID`, `YESCODE_REMOTE_SESSION_ID` (random UUIDs at boot if unset)
-- `deviceId` (sha256 of `YESCODE_DEVICE_SEED`, defaults to `"yescode-proxy-default"`)
+- `YESCODE_REMOTE_CONTAINER_ID`、`YESCODE_REMOTE_SESSION_ID`（未设置时启动时随机生成 UUID）
+- `deviceId`（`YESCODE_DEVICE_SEED` 的 sha256，默认 `"yescode-proxy-default"`）
 
-Override the path that's watched with `YESCODE_ENV_FILE=<path>`.
+通过 `YESCODE_ENV_FILE=<path>` 可以覆盖被监视的路径。
 
-## Log rotation
+## 日志轮转
 
-`StandardOutput=append:~/.local/state/yescode-proxy.log` writes forever; rotation is driven by a separate user-level systemd timer + logrotate (no root needed).
+`StandardOutput=append:~/.local/state/yescode-proxy.log` 永久追加；轮转由独立的用户级 systemd timer + logrotate 完成（不需要 root）。
 
-| File | Role |
+| 文件 | 用途 |
 |---|---|
-| `~/.config/logrotate/yescode-proxy.conf` | logrotate ruleset |
-| `~/.config/systemd/user/yescode-proxy-logrotate.service` | oneshot that runs `logrotate` |
-| `~/.config/systemd/user/yescode-proxy-logrotate.timer` | `OnCalendar=hourly`, `Persistent=true` |
-| `~/.local/state/yescode-proxy-logrotate.state` | logrotate's own state file |
+| `~/.config/logrotate/yescode-proxy.conf` | logrotate 规则集 |
+| `~/.config/systemd/user/yescode-proxy-logrotate.service` | 跑 `logrotate` 的 oneshot |
+| `~/.config/systemd/user/yescode-proxy-logrotate.timer` | `OnCalendar=hourly`、`Persistent=true` |
+| `~/.local/state/yescode-proxy-logrotate.state` | logrotate 自己的状态文件 |
 
-**Policy**: daily OR ≥ 100M, whichever comes first; keep 7 compressed history files; **copytruncate** so the proxy's open append-fd stays valid (no service reload needed). Worst-case footprint ≈ 100M active + 7 × ~10M compressed ≈ **~170M**.
+**策略**：按天 或 ≥ 100M 二者先到者轮转；保留 7 份压缩历史；**copytruncate** 模式让 proxy 已打开的 append-fd 继续有效（无需 reload 服务）。最坏占用 ≈ 100M 当前 + 7 × ~10M 压缩 ≈ **~170M**。
 
-Rotated files are named `yescode-proxy.log-<YYYYMMDD>-<unix>.gz` (newest one stays uncompressed thanks to `delaycompress`).
+轮转后的文件命名为 `yescode-proxy.log-<YYYYMMDD>-<unix>.gz`（最近一份因 `delaycompress` 暂不压缩）。
 
-## Configuration
+## 配置
 
-Copy `.env.example` to `.env` and fill in. All keys are hot-reloadable except `PORT` / `BIND`.
+把 `.env.example` 复制为 `.env` 后填写。除了 `PORT` / `BIND`，所有 key 都支持热重载。
 
-| Key | Default | Purpose |
+| Key | 默认值 | 用途 |
 |---|---|---|
-| `PORT` | `18790` | Listen port (restart only). |
-| `BIND` | `127.0.0.1` | Listen address (restart only). |
-| `YESCODE_PRIMARY` | `co.yes.vg` | Primary upstream. |
-| `YESCODE_FALLBACK` | `co-cdn.yes.vg` | Fallback when primary returns a retriable network error. |
-| `YESCODE_PATH_PREFIX` | _empty_ | Prefix prepended to every upstream URL. `/team` for team accounts, blank for personal. |
-| `YESCODE_API_KEY` | _empty_ | Unified key for all three routes. Force-overrides client-supplied auth. |
-| `YESCODE_API_KEY_ANTHROPIC` / `_OPENAI` / `_GEMINI` | _empty_ | Per-route overrides; fall back to `YESCODE_API_KEY`. |
-| `YESCODE_TIMEOUT_MS` | `3600000` | Upstream request timeout (ms). Default 1h to fit long agent runs. |
-| `YESCODE_CLAUDE_CLI_VERSION` | `2.1.75` | Used to build the spoofed `User-Agent`. |
-| `YESCODE_CLAUDE_CLI_ENTRYPOINT` | `cli` | Same. |
-| `YESCODE_ANTHROPIC_BETA` | `context-management-2025-06-27,interleaved-thinking-2025-05-14` | `anthropic-beta` header. |
-| `YESCODE_FULL_FINGERPRINT` | _off_ | `1` = also send Stainless SDK telemetry + remote-container/session headers. |
-| `YESCODE_STAINLESS_VERSION` | `0.74.0` | `X-Stainless-Package-Version`. |
-| `YESCODE_DEVICE_SEED` | `yescode-proxy-default` | Hashed into the `metadata.user_id` device hash (stable across reloads). |
-| `YESCODE_REMOTE_CONTAINER_ID` / `_SESSION_ID` | _random per boot_ | Stable across reloads when unset; set explicitly to override. |
-| `YESCODE_ENV_FILE` | `./. env` | Path to watch for reload. Useful if the working dir isn't where `.env` lives. |
+| `PORT` | `18790` | 监听端口（仅重启生效）。 |
+| `BIND` | `127.0.0.1` | 监听地址（仅重启生效）。 |
+| `YESCODE_PRIMARY` | `co.yes.vg` | 主上游。 |
+| `YESCODE_FALLBACK` | `co-cdn.yes.vg` | 主上游返回可重试网络错误时的回落上游。 |
+| `YESCODE_PATH_PREFIX` | _空_ | 拼到每个上游 URL 前的前缀。team 账号填 `/team`，个人账号留空。 |
+| `YESCODE_API_KEY` | _空_ | 三个路由共用的 key，强制覆盖客户端自带鉴权。 |
+| `YESCODE_API_KEY_ANTHROPIC` / `_OPENAI` / `_GEMINI` | _空_ | 各路由独立覆盖；缺省回落到 `YESCODE_API_KEY`。 |
+| `YESCODE_TIMEOUT_MS` | `3600000` | 上游请求超时（毫秒）。默认 1 小时，适配长时间运行的 agent 任务。 |
+| `YESCODE_CLAUDE_CLI_VERSION` | `2.1.75` | 用于伪造 `User-Agent`。 |
+| `YESCODE_CLAUDE_CLI_ENTRYPOINT` | `cli` | 同上。 |
+| `YESCODE_ANTHROPIC_BETA` | `context-management-2025-06-27,interleaved-thinking-2025-05-14` | `anthropic-beta` 请求头。 |
+| `YESCODE_FULL_FINGERPRINT` | _关_ | `1` = 同时发送 Stainless SDK 遥测 + remote-container/session 请求头。 |
+| `YESCODE_STAINLESS_VERSION` | `0.74.0` | `X-Stainless-Package-Version`。 |
+| `YESCODE_DEVICE_SEED` | `yescode-proxy-default` | 哈希后写入 `metadata.user_id` 的设备 hash（跨重载稳定）。 |
+| `YESCODE_REMOTE_CONTAINER_ID` / `_SESSION_ID` | _每次启动随机_ | 未设置时跨重载保持启动时的值；显式设置可覆盖。 |
+| `YESCODE_ENV_FILE` | `./. env` | 被监视的路径。若工作目录不是 `.env` 所在位置时有用。 |
 
-## Common operations
+## 常用操作
 
 ```bash
-# status / start / stop
+# 状态 / 启动 / 停止
 systemctl --user status yescode-proxy
-systemctl --user restart yescode-proxy           # only needed for PORT/BIND or server.js changes
+systemctl --user restart yescode-proxy           # 只在改了 PORT/BIND 或 server.js 后才需要
 systemctl --user stop yescode-proxy
 
-# trigger reload (after editing .env — usually unnecessary, fs.watchFile picks it up)
+# 触发 reload（改完 .env 后 —— 一般不必，fs.watchFile 会自动捕获）
 systemctl --user reload yescode-proxy
 
-# logs
-tail -f ~/.local/state/yescode-proxy.log         # live, full
-journalctl --user -u yescode-proxy -f            # same content, but with journald metadata
-journalctl --user -u yescode-proxy | grep 'config reload'   # see hot-reload history
-ls -lh ~/.local/state/yescode-proxy*             # rotated archives
+# 日志
+tail -f ~/.local/state/yescode-proxy.log         # 实时全量
+journalctl --user -u yescode-proxy -f            # 内容相同，附带 journald 元数据
+journalctl --user -u yescode-proxy | grep 'config reload'   # 查看热重载历史
+ls -lh ~/.local/state/yescode-proxy*             # 已轮转的归档
 
-# log rotation
-systemctl --user list-timers yescode-proxy-logrotate           # next run
-systemctl --user status yescode-proxy-logrotate.service        # last run
+# 日志轮转
+systemctl --user list-timers yescode-proxy-logrotate           # 下次执行时间
+systemctl --user status yescode-proxy-logrotate.service        # 上次执行
 logrotate -d -s ~/.local/state/yescode-proxy-logrotate.state \
   ~/.config/logrotate/yescode-proxy.conf                       # dry-run
 logrotate --force -s ~/.local/state/yescode-proxy-logrotate.state \
-  ~/.config/logrotate/yescode-proxy.conf                       # force rotate now
+  ~/.config/logrotate/yescode-proxy.conf                       # 立即强制轮转
 
-# health
+# 健康检查
 curl -s http://127.0.0.1:18790/health
 ```
 
-## Re-deploying changes
+## 重新部署变更
 
-| Changed | Action |
+| 改了什么 | 操作 |
 |---|---|
-| `.env` | nothing — auto-reload (or `systemctl --user reload yescode-proxy`) |
+| `.env` | 无需操作 —— 自动 reload（或 `systemctl --user reload yescode-proxy`） |
 | `server.js` | `systemctl --user restart yescode-proxy` |
-| `yescode-proxy.service` | `cp` into `~/.config/systemd/user/`, then `systemctl --user daemon-reload && systemctl --user restart yescode-proxy` |
-| logrotate config / timer / service | edit under `~/.config/...`, then `systemctl --user daemon-reload && systemctl --user restart yescode-proxy-logrotate.timer` |
+| `yescode-proxy.service` | `cp` 到 `~/.config/systemd/user/`，然后 `systemctl --user daemon-reload && systemctl --user restart yescode-proxy` |
+| logrotate 配置 / timer / service | 在 `~/.config/...` 下改完后执行 `systemctl --user daemon-reload && systemctl --user restart yescode-proxy-logrotate.timer` |
