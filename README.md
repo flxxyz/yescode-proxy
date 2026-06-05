@@ -156,6 +156,131 @@ YESCODE_API_KEY=team-xxxxxxxx ./install.sh
 | `YESCODE_REMOTE_SESSION_ID` | _每次启动随机_ | 未设置时跨重载保持启动时的值；显式设置可覆盖。 |
 | `YESCODE_ENV_FILE` | `./.env` | 被监视的路径。若工作目录不是 `.env` 所在位置时有用。 |
 
+## 请求示例
+
+下面的示例直接请求本地代理（默认 `http://127.0.0.1:18790`），可作为接入参考。客户端无需自带 API key：代理会剥离客户端鉴权头并注入配置的 YesCode key，因此 `Authorization` 头可以省略。所有请求都用 POST，并带 `Content-Type: application/json`。
+
+### 原生协议路由
+
+以下三条路由是 passthrough：请求体用对应厂商的原生格式，代理只替换鉴权与指纹，不翻译协议。
+
+Anthropic Messages 协议，路由 `/v1/messages`：
+
+```bash
+curl http://127.0.0.1:18790/v1/messages \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "用一句话解释 TCP 三次握手"}]
+  }'
+```
+
+其中 `anthropic-version` 请求头由代理自动注入，客户端无需提供。
+
+OpenAI Responses 协议，路由 `/v1/responses`：
+
+```bash
+curl http://127.0.0.1:18790/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gpt-5.5",
+    "input": "用一句话解释 TCP 三次握手"
+  }'
+```
+
+YesCode 的 OpenAI 端点是 `/v1/responses`；`/v1/chat/completions` 是下面的统一入口，二者不同。
+
+Gemini generateContent 协议，路由 `/v1beta/models/{model}:generateContent`：
+
+```bash
+curl http://127.0.0.1:18790/v1beta/models/gemini-2.5-flash:generateContent \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "contents": [{"role": "user", "parts": [{"text": "用一句话解释 TCP 三次握手"}]}]
+  }'
+```
+
+### 统一入口 /v1/chat/completions
+
+用 OpenAI Chat Completions 格式发请求，代理按 `model` 名前缀自动路由到三家后端并双向翻译协议：`claude*` 走 Anthropic、`gemini*` 走 Gemini、其余（`gpt*`、`o*`、`*codex*`）走 OpenAI。只需替换 `model`，请求体结构不变。
+
+路由到 Claude（`model` 以 `claude` 开头）：
+
+```bash
+curl http://127.0.0.1:18790/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "messages": [{"role": "user", "content": "用一句话解释 TCP 三次握手"}]
+  }'
+```
+
+路由到 Gemini（`model` 以 `gemini` 开头）：
+
+```bash
+curl http://127.0.0.1:18790/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gemini-2.5-flash",
+    "messages": [{"role": "user", "content": "用一句话解释 TCP 三次握手"}]
+  }'
+```
+
+路由到 OpenAI（`model` 以 `gpt` 开头，或其它未匹配前缀）：
+
+```bash
+curl http://127.0.0.1:18790/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gpt-5.5",
+    "messages": [{"role": "user", "content": "用一句话解释 TCP 三次握手"}]
+  }'
+```
+
+### 流式与工具调用
+
+统一入口支持流式输出（`stream: true`，响应为 `text/event-stream`）和工具调用（`tools`）；三家后端的响应都会翻译回 Chat Completions 格式。
+
+流式请求加 `stream: true`，并用 `curl -N` 关闭缓冲、逐块接收：
+
+```bash
+curl -N http://127.0.0.1:18790/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "stream": true,
+    "messages": [{"role": "user", "content": "用一句话解释 TCP 三次握手"}]
+  }'
+```
+
+响应是一连串 `chat.completion.chunk`，以 `data: [DONE]` 结束。
+
+工具调用在 `tools` 里声明函数（OpenAI 函数调用格式），换 `model` 即切换后端：
+
+```bash
+curl http://127.0.0.1:18790/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gpt-5.5",
+    "messages": [{"role": "user", "content": "北京现在天气怎么样？"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "查询指定城市的当前天气",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string", "description": "城市名"}},
+          "required": ["city"]
+        }
+      }
+    }]
+  }'
+```
+
+模型决定调用工具时，响应的 `choices[0].message.tool_calls` 会带 `get_weather` 及其 JSON 参数。
+
 ## 常用操作
 
 ```bash

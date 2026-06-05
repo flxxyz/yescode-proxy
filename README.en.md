@@ -156,6 +156,131 @@ Copy `.env.example` to `.env` and fill in. All keys are hot-reloadable except `P
 | `YESCODE_REMOTE_SESSION_ID` | _random per boot_ | Stable across reloads when unset; set explicitly to override. |
 | `YESCODE_ENV_FILE` | `./.env` | Path to watch for reload. Useful if the working dir isn't where `.env` lives. |
 
+## Request examples
+
+These examples call the local proxy directly (default `http://127.0.0.1:18790`) and are meant as a reference for wiring up clients. No client API key is required: the proxy strips client auth headers and injects the configured YesCode key, so the `Authorization` header can be omitted. Every request is a `POST` with `Content-Type: application/json`.
+
+### Native protocol routes
+
+These three routes are passthrough: send each provider's native body shape, and the proxy only swaps auth and fingerprint — it does not translate the protocol.
+
+Anthropic Messages, route `/v1/messages`:
+
+```bash
+curl http://127.0.0.1:18790/v1/messages \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Explain the TCP three-way handshake in one sentence."}]
+  }'
+```
+
+The `anthropic-version` header is injected by the proxy; the client does not need to send it.
+
+OpenAI Responses, route `/v1/responses`:
+
+```bash
+curl http://127.0.0.1:18790/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gpt-5.5",
+    "input": "Explain the TCP three-way handshake in one sentence."
+  }'
+```
+
+YesCode's OpenAI endpoint is `/v1/responses`; `/v1/chat/completions` is the universal endpoint below — the two are different.
+
+Gemini generateContent, route `/v1beta/models/{model}:generateContent`:
+
+```bash
+curl http://127.0.0.1:18790/v1beta/models/gemini-2.5-flash:generateContent \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "contents": [{"role": "user", "parts": [{"text": "Explain the TCP three-way handshake in one sentence."}]}]
+  }'
+```
+
+### Universal endpoint /v1/chat/completions
+
+Send requests in OpenAI Chat Completions format; the proxy routes by `model` name prefix to all three backends and translates the protocol in both directions: `claude*` goes to Anthropic, `gemini*` to Gemini, and everything else (`gpt*`, `o*`, `*codex*`) to OpenAI. Only the `model` changes — the request body shape stays the same.
+
+Route to Claude (`model` starts with `claude`):
+
+```bash
+curl http://127.0.0.1:18790/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "messages": [{"role": "user", "content": "Explain the TCP three-way handshake in one sentence."}]
+  }'
+```
+
+Route to Gemini (`model` starts with `gemini`):
+
+```bash
+curl http://127.0.0.1:18790/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gemini-2.5-flash",
+    "messages": [{"role": "user", "content": "Explain the TCP three-way handshake in one sentence."}]
+  }'
+```
+
+Route to OpenAI (`model` starts with `gpt`, or any unmatched prefix):
+
+```bash
+curl http://127.0.0.1:18790/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gpt-5.5",
+    "messages": [{"role": "user", "content": "Explain the TCP three-way handshake in one sentence."}]
+  }'
+```
+
+### Streaming and tool calls
+
+The universal endpoint supports streaming (`stream: true`, response is `text/event-stream`) and tool calls (`tools`); responses from all three backends are translated back into Chat Completions format.
+
+For streaming, add `stream: true` and use `curl -N` to disable buffering and receive chunks as they arrive:
+
+```bash
+curl -N http://127.0.0.1:18790/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "stream": true,
+    "messages": [{"role": "user", "content": "Explain the TCP three-way handshake in one sentence."}]
+  }'
+```
+
+The response is a stream of `chat.completion.chunk` events, terminated by `data: [DONE]`.
+
+Tool calls declare functions under `tools` (OpenAI function-calling format); switch the `model` to switch backends:
+
+```bash
+curl http://127.0.0.1:18790/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gpt-5.5",
+    "messages": [{"role": "user", "content": "What'\''s the weather in Beijing right now?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a given city",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string", "description": "City name"}},
+          "required": ["city"]
+        }
+      }
+    }]
+  }'
+```
+
+When the model decides to call the tool, the response's `choices[0].message.tool_calls` carries `get_weather` and its JSON arguments.
+
 ## Common operations
 
 ```bash
