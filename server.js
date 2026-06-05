@@ -1,4 +1,4 @@
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { performance } from 'node:perf_hooks';
 import { createHash, randomUUID } from 'node:crypto';
@@ -90,23 +90,76 @@ function loadEnvFile(path) {
 }
 
 function loadConfig() {
-  const upstreamTimeoutMs = Number.parseInt(process.env.YESCODE_TIMEOUT_MS ?? '3600000', 10);
+  const upstreamTimeoutMs = Number.parseInt(process.env.YESCODE_TIMEOUT_MS ?? '30000', 10);
   const claudeCliVersion = process.env.YESCODE_CLAUDE_CLI_VERSION ?? '2.1.75';
   const claudeCliEntrypoint = process.env.YESCODE_CLAUDE_CLI_ENTRYPOINT ?? 'cli';
+  const codexCliVersion = process.env.YESCODE_CODEX_CLI_VERSION ?? '0.137.0';
   const stainlessPackageVersion = process.env.YESCODE_STAINLESS_VERSION ?? '0.74.0';
   const deviceSeed = process.env.YESCODE_DEVICE_SEED ?? 'yescode-proxy-default';
 
+  // Upstream statuses that mean "this key won't work" — trigger a retry with the
+  // next credential in the chain. Stored as a sorted array (not a Set) so diffConfig
+  // can compare it by key without an empty-Set false-negative on reload.
+  const keyFallbackStatuses = Array.from(new Set(
+    (process.env.YESCODE_KEY_FALLBACK_STATUSES ?? '401,403')
+      .split(',')
+      .map((s) => Number.parseInt(s.trim(), 10))
+      .filter((n) => Number.isInteger(n) && n >= 100 && n <= 599),
+  )).sort((a, b) => a - b);
+
+  // Upstream statuses that mean "transient, try again" — the proxy retries the
+  // same request (same key) on the primary's backoff schedule before giving up,
+  // mirroring what the Anthropic/OpenAI SDKs do client-side. Default 429/503/529
+  // (rate-limited, "no capacity available", overloaded). Distinct from
+  // keyFallbackStatuses: those switch credential, these just retry.
+  const retryStatuses = Array.from(new Set(
+    (process.env.YESCODE_RETRY_STATUSES ?? '429,503,529')
+      .split(',')
+      .map((s) => Number.parseInt(s.trim(), 10))
+      .filter((n) => Number.isInteger(n) && n >= 100 && n <= 599),
+  )).sort((a, b) => a - b);
+
+  // Each upstream is a full URL (scheme + host + optional path prefix), e.g.
+  // https://co.yes.vg/team. Split it into the pieces the dispatcher needs: the
+  // request fn is chosen by protocol, host/port address the socket, and prefix is
+  // prepended to every route path. A bare host path ("/") yields an empty prefix.
+  const parseUpstream = (raw, fallbackRaw) => {
+    const u = new URL((raw ?? '').trim() || fallbackRaw);
+    return Object.freeze({
+      protocol: u.protocol,
+      host: u.hostname,
+      port: u.port ? Number.parseInt(u.port, 10) : (u.protocol === 'http:' ? 80 : 443),
+      prefix: u.pathname.replace(/\/+$/, ''),
+    });
+  };
+
   return Object.freeze({
-    primaryHost: process.env.YESCODE_PRIMARY ?? 'co.yes.vg',
-    fallbackHost: process.env.YESCODE_FALLBACK ?? 'co-cdn.yes.vg',
-    pathPrefix: (process.env.YESCODE_PATH_PREFIX ?? '').replace(/\/+$/, ''),
+    primary: parseUpstream(process.env.YESCODE_PRIMARY_URL, 'https://co.yes.vg/team'),
+    fallback: parseUpstream(process.env.YESCODE_FALLBACK_URL, 'https://co-cdn.yes.vg/team'),
     apiKey: process.env.YESCODE_API_KEY ?? '',
     apiKeyAnthropic: process.env.YESCODE_API_KEY_ANTHROPIC ?? '',
     apiKeyOpenai: process.env.YESCODE_API_KEY_OPENAI ?? '',
     apiKeyGemini: process.env.YESCODE_API_KEY_GEMINI ?? '',
+    keyFallbackStatuses,
+    retryStatuses,
+    // Debug aid: when on, log the (redacted-header) request, the client + upstream
+    // bodies, and the upstream response body for every request. Off by default.
+    debugBodies: /^(1|true|yes|on)$/i.test((process.env.YESCODE_DEBUG_BODIES ?? '').trim()),
     upstreamTimeoutMs,
     // Real claude-cli formats UA as `claude-cli/<v> (external, <entrypoint>[, agent-sdk/...])`.
     claudeUserAgent: `claude-cli/${claudeCliVersion} (external, ${claudeCliEntrypoint})`,
+    // YesCode gates the codex models (gpt-5.x / *-codex on /v1/responses) behind a
+    // User-Agent prefix check: a UA starting with `codex` routes to the real Codex
+    // app-server, anything else falls through to an unconfigured path that 503s with
+    // "Codex app-server responses fallback is not configured". We spoof a codex client
+    // on the OpenAI route. `originator` is sent for fidelity but isn't load-bearing.
+    codexUserAgent: process.env.YESCODE_CODEX_USER_AGENT ?? `codex_cli_rs/${codexCliVersion}`,
+    codexOriginator: process.env.YESCODE_CODEX_ORIGINATOR ?? 'codex_cli_rs',
+    // YesCode's gemini upstream 403s on user-agents that look like a competing SDK
+    // (e.g. the OpenAI JS SDK). The gemini route forwards the client's UA verbatim,
+    // so we override it with an official-looking Google GenAI SDK UA. It's a
+    // blacklist (curl and absent UAs pass), so any non-OpenAI value works.
+    geminiUserAgent: process.env.YESCODE_GEMINI_USER_AGENT ?? 'google-genai-sdk/1.16.0 gl-node/v22.0.0',
     // `fine-grained-tool-streaming-2025-05-14` was retired by the Claude Code SDK in
     // recent versions; v2.1.75 keeps `interleaved-thinking-2025-05-14` and adds
     // `context-management-2025-06-27`.
@@ -217,11 +270,24 @@ function applyReload(reason) {
   config = next;
 }
 
-function keyForRoute(route) {
-  if (route === 'anthropic' && config.apiKeyAnthropic) return config.apiKeyAnthropic;
-  if (route === 'openai' && config.apiKeyOpenai) return config.apiKeyOpenai;
-  if (route === 'gemini' && config.apiKeyGemini) return config.apiKeyGemini;
-  return config.apiKey;
+function fallbackKeyForRoute(route) {
+  if (route === 'anthropic') return { key: config.apiKeyAnthropic, label: 'anthropic' };
+  if (route === 'openai' || route === 'openai-chat') return { key: config.apiKeyOpenai, label: 'openai' };
+  if (route === 'gemini') return { key: config.apiKeyGemini, label: 'gemini' };
+  return { key: '', label: route };
+}
+
+// Ordered credential chain for a route: team key first, then the route's
+// per-provider fallback key. The proxy walks this list, retrying with the next
+// credential when the upstream rejects one with a keyFallbackStatuses code.
+// All credentials share the same upstream (host + prefix) — only the key changes.
+function credentialsForRoute(route) {
+  const creds = [];
+  if (config.apiKey) creds.push({ key: config.apiKey, label: 'team' });
+  const fb = fallbackKeyForRoute(route);
+  if (fb.key) creds.push({ key: fb.key, label: fb.label });
+  if (creds.length === 0) creds.push({ key: config.apiKey, label: 'team' });
+  return creds;
 }
 
 function readBody(req) {
@@ -237,15 +303,60 @@ function readBody(req) {
   });
 }
 
+// --- debug-body logging (config.debugBodies) ---
+const DEBUG_BODY_LIMIT = 16384;
+function previewBody(buf) {
+  if (buf == null || buf.length === 0) return '(empty)';
+  const s = Buffer.isBuffer(buf) ? buf.toString('utf8') : String(buf);
+  return s.length > DEBUG_BODY_LIMIT
+    ? `${s.slice(0, DEBUG_BODY_LIMIT)}…[+${s.length - DEBUG_BODY_LIMIT} chars]`
+    : s;
+}
+const REDACT_HEADER = /^(authorization|x-api-key|api-key|proxy-authorization|cookie)$/i;
+function redactHeaders(headers) {
+  const out = {};
+  for (const [k, v] of Object.entries(headers ?? {})) {
+    out[k] = REDACT_HEADER.test(k) ? '<redacted>' : v;
+  }
+  return out;
+}
+
 function classifyRoute(urlPath) {
-  if (urlPath.startsWith('/gemini/')) return 'gemini';
+  // Gemini's native API path is `/v1beta/...` — distinct from OpenAI's `/v1/...`.
+  if (urlPath.startsWith('/v1beta/')) return 'gemini';
   if (urlPath === '/v1/messages' || urlPath.startsWith('/v1/messages/') || urlPath.startsWith('/v1/messages?')) return 'anthropic';
+  if (urlPath === '/v1/chat/completions' || urlPath.startsWith('/v1/chat/completions?')) return 'openai-chat';
   if (urlPath.startsWith('/v1/')) return 'openai';
   return 'unknown';
 }
 
+// The /v1/chat/completions endpoint is universal: the model-name prefix picks the
+// upstream provider so one OpenAI-shaped request can reach Claude / Gemini / OpenAI.
+function providerForModel(model) {
+  const m = String(model ?? '');
+  if (/^claude/i.test(m)) return 'anthropic';
+  if (/^gemini/i.test(m)) return 'gemini';
+  // Recognized OpenAI families: gpt-*, o-series (o1/o3/o4…), chatgpt-*, *codex*.
+  if (/^gpt/i.test(m) || /^o\d/i.test(m) || /^chatgpt/i.test(m) || /codex/i.test(m)) return 'openai';
+  // Last-resort default: anything unrecognized also routes to OpenAI.
+  return 'openai';
+}
+
+// Anthropic's Messages API requires max_tokens. Chat Completions makes it optional,
+// so when a chat client omits it we fall back to this when translating chat→messages.
+const DEFAULT_ANTHROPIC_MAX_TOKENS = 4096;
+
+// YesCode gates the higher-tier Claude models (opus-4-x, sonnet-4-6) behind the
+// presence of a non-empty `system` field: a request without one is rejected with
+// 503 "no capacity available" even though the model is allowed. Real Claude Code
+// always sends its identity preamble, so it never trips the gate; a bare client
+// (or a translated chat→messages body) may omit system and get 503. We inject
+// this minimal default when none is supplied. Only presence is gated upstream —
+// the content is not validated — and any client-supplied system is preserved.
+const CLAUDE_CODE_SYSTEM_PREAMBLE = "You are Claude Code, Anthropic's official CLI for Claude.";
+
 function extractReqMeta(buf, urlPath, route) {
-  const geminiMatch = urlPath.match(/\/gemini\/[^/]+\/models\/([^:?]+)/);
+  const geminiMatch = urlPath.match(/\/v1beta\/models\/([^:?]+)/);
   let model = geminiMatch ? geminiMatch[1] : null;
   let maxTokens = null;
   let stream = false;
@@ -305,7 +416,7 @@ function extractJSONUsage(buf, route) {
   try {
     const obj = JSON.parse(buf.toString('utf8'));
     if (route === 'anthropic') return usageFromAnthropic(obj.usage);
-    if (route === 'openai') return usageFromOpenAI(obj.usage);
+    if (route === 'openai' || route === 'openai-chat') return usageFromOpenAI(obj.usage);
     if (route === 'gemini') return usageFromGemini(obj.usageMetadata);
   } catch {
     // not JSON, or no usage
@@ -356,7 +467,7 @@ function extractSSEUsage(buf, route) {
       if (!payload || payload === '[DONE]') continue;
       try {
         const obj = JSON.parse(payload);
-        if (route === 'openai') {
+        if (route === 'openai' || route === 'openai-chat') {
           if (obj.usage) return usageFromOpenAI(obj.usage);
           if (obj.type === 'response.completed' && obj.response?.usage) return usageFromOpenAI(obj.response.usage);
         } else if (route === 'gemini') {
@@ -376,42 +487,1186 @@ function buildLegacyUserId(sessionId) {
 
 // Returns the rewritten body buffer (or the original if no rewrite needed)
 // plus the user_id and session_id we ended up using. Anthropic-route only.
+// True when an Anthropic `system` field carries no usable prompt. Handles the
+// three shapes the Messages API accepts: absent/null, a plain string, or an
+// array of text blocks. Unknown shapes are left alone (return false) so we never
+// clobber something a client meant to send.
+function isEmptySystem(system) {
+  if (system == null) return true;
+  if (typeof system === 'string') return system.trim().length === 0;
+  if (Array.isArray(system)) {
+    return !system.some((block) =>
+      block && typeof block === 'object' &&
+      typeof block.text === 'string' && block.text.trim().length > 0);
+  }
+  return false;
+}
+
+// Whether metadata.user_id needs to be (re)written to the Claude-CLI legacy
+// shape. Already-legacy ids and valid JSON session ids are left untouched.
+function needsUserIdRewrite(metadata) {
+  const existing = typeof metadata.user_id === 'string' ? metadata.user_id.trim() : '';
+  if (!existing) return true;
+  if (LEGACY_USER_ID_PATTERN.test(existing)) return false;
+  try {
+    const parsed = JSON.parse(existing);
+    if (parsed && typeof parsed === 'object' && typeof parsed.session_id === 'string') {
+      return false;
+    }
+  } catch {
+    // not JSON, needs rewrite
+  }
+  return true;
+}
+
 function injectClaudeMetadata(body) {
-  if (!body?.length) return { body, injected: false };
+  if (!body?.length) return { body, injected: false, systemInjected: false };
   let json;
   try {
     json = JSON.parse(body.toString('utf8'));
   } catch {
-    return { body, injected: false };
+    return { body, injected: false, systemInjected: false };
   }
-  if (!json || typeof json !== 'object') return { body, injected: false };
+  if (!json || typeof json !== 'object') return { body, injected: false, systemInjected: false };
 
+  // user_id fingerprint: stamp the Claude-CLI legacy shape when missing/foreign.
   const metadata = (typeof json.metadata === 'object' && json.metadata !== null)
     ? json.metadata
     : {};
-  const existing = typeof metadata.user_id === 'string' ? metadata.user_id.trim() : '';
-  if (existing && LEGACY_USER_ID_PATTERN.test(existing)) {
-    return { body, injected: false };
+  let injected = false;
+  if (needsUserIdRewrite(metadata)) {
+    const sessionId = typeof metadata.session_id === 'string' && metadata.session_id.length
+      ? metadata.session_id
+      : randomUUID();
+    json.metadata = { ...metadata, user_id: buildLegacyUserId(sessionId) };
+    injected = true;
   }
-  if (existing) {
-    try {
-      const parsed = JSON.parse(existing);
-      if (parsed && typeof parsed === 'object' && typeof parsed.session_id === 'string') {
-        return { body, injected: false };
+
+  // system gate: supply a default preamble when the client sent none, so the
+  // models YesCode gates on system-presence don't 503. See the constant above.
+  let systemInjected = false;
+  if (isEmptySystem(json.system)) {
+    json.system = CLAUDE_CODE_SYSTEM_PREAMBLE;
+    systemInjected = true;
+  }
+
+  if (!injected && !systemInjected) return { body, injected: false, systemInjected: false };
+  return { body: Buffer.from(JSON.stringify(json), 'utf8'), injected, systemInjected };
+}
+
+// ---- /v1/chat/completions ↔ /v1/responses translation ----
+//
+// Yescode's OpenAI endpoint is /v1/responses only. We accept the older
+// Chat Completions shape on /v1/chat/completions, translate to Responses
+// for the upstream call, and translate the response (streaming or not)
+// back to Chat Completions so OpenAI-SDK clients work unchanged.
+
+function normalizeUserContent(content) {
+  if (typeof content === 'string') return content ? [{ type: 'input_text', text: content }] : [];
+  if (!Array.isArray(content)) return [];
+  const out = [];
+  for (const p of content) {
+    if (!p || typeof p !== 'object') continue;
+    if (p.type === 'text' && typeof p.text === 'string') {
+      out.push({ type: 'input_text', text: p.text });
+    } else if (p.type === 'image_url' && p.image_url) {
+      const url = typeof p.image_url === 'string' ? p.image_url : p.image_url.url;
+      if (typeof url === 'string') {
+        out.push({
+          type: 'input_image',
+          image_url: url,
+          detail: (p.image_url && typeof p.image_url === 'object' && p.image_url.detail) || 'auto',
+        });
       }
-    } catch {
-      // not JSON, fall through and rewrite
+    }
+  }
+  return out;
+}
+
+function normalizeAssistantTextContent(content) {
+  if (typeof content === 'string') return content ? [{ type: 'output_text', text: content }] : [];
+  if (!Array.isArray(content)) return [];
+  const out = [];
+  for (const p of content) {
+    if (p?.type === 'text' && typeof p.text === 'string' && p.text.length) {
+      out.push({ type: 'output_text', text: p.text });
+    }
+  }
+  return out;
+}
+
+function chatToResponses(reqBody) {
+  let chat;
+  try {
+    chat = JSON.parse(reqBody.toString('utf8'));
+  } catch (err) {
+    throw new Error(`invalid JSON body: ${err.message}`);
+  }
+  if (!chat || typeof chat !== 'object') throw new Error('body is not an object');
+  if (!Array.isArray(chat.messages)) throw new Error('missing messages array');
+
+  const out = {};
+  if (typeof chat.model === 'string') out.model = chat.model;
+
+  const instructions = [];
+  const input = [];
+  for (const msg of chat.messages) {
+    if (!msg || typeof msg !== 'object' || typeof msg.role !== 'string') continue;
+    if (msg.role === 'system' || msg.role === 'developer') {
+      if (typeof msg.content === 'string') {
+        if (msg.content) instructions.push(msg.content);
+      } else if (Array.isArray(msg.content)) {
+        const txt = msg.content
+          .filter((p) => p?.type === 'text' && typeof p.text === 'string')
+          .map((p) => p.text)
+          .join('');
+        if (txt) instructions.push(txt);
+      }
+      continue;
+    }
+    if (msg.role === 'user') {
+      const parts = normalizeUserContent(msg.content);
+      if (parts.length) input.push({ type: 'message', role: 'user', content: parts });
+      continue;
+    }
+    if (msg.role === 'assistant') {
+      const parts = normalizeAssistantTextContent(msg.content);
+      if (parts.length) input.push({ type: 'message', role: 'assistant', content: parts });
+      if (Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          if (!tc || tc.type !== 'function' || !tc.function) continue;
+          input.push({
+            type: 'function_call',
+            call_id: tc.id,
+            name: tc.function.name,
+            arguments: typeof tc.function.arguments === 'string'
+              ? tc.function.arguments
+              : JSON.stringify(tc.function.arguments ?? {}),
+          });
+        }
+      }
+      continue;
+    }
+    if (msg.role === 'tool') {
+      const callId = typeof msg.tool_call_id === 'string' && msg.tool_call_id
+        ? msg.tool_call_id
+        : `call_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+      const output = typeof msg.content === 'string'
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content.filter((p) => p?.type === 'text' && typeof p.text === 'string').map((p) => p.text).join('')
+          : '';
+      input.push({ type: 'function_call_output', call_id: callId, output });
+      continue;
+    }
+    if (msg.role === 'function') {
+      // deprecated function role — synthesize a call_id since there's none on the wire
+      const callId = `call_${createHash('sha256').update(`fn_${msg.name ?? ''}`).digest('hex').slice(0, 16)}`;
+      const output = typeof msg.content === 'string' ? msg.content : '';
+      input.push({ type: 'function_call_output', call_id: callId, output });
     }
   }
 
-  const sessionId = typeof metadata.session_id === 'string' && metadata.session_id.length
-    ? metadata.session_id
-    : randomUUID();
-  json.metadata = { ...metadata, user_id: buildLegacyUserId(sessionId) };
-  return { body: Buffer.from(JSON.stringify(json), 'utf8'), injected: true };
+  out.input = input;
+  if (instructions.length) out.instructions = instructions.join('\n\n');
+
+  if (Array.isArray(chat.tools)) {
+    out.tools = chat.tools
+      .filter((t) => t?.type === 'function' && t.function && typeof t.function.name === 'string')
+      .map((t) => {
+        const tool = {
+          type: 'function',
+          name: t.function.name,
+          description: t.function.description,
+          parameters: t.function.parameters,
+        };
+        if (t.function.strict !== undefined) tool.strict = t.function.strict;
+        return tool;
+      });
+  }
+
+  if (chat.tool_choice !== undefined) {
+    if (typeof chat.tool_choice === 'string') {
+      out.tool_choice = chat.tool_choice;
+    } else if (chat.tool_choice?.type === 'function' && chat.tool_choice.function?.name) {
+      out.tool_choice = { type: 'function', name: chat.tool_choice.function.name };
+    }
+  }
+  if (chat.parallel_tool_calls !== undefined) out.parallel_tool_calls = chat.parallel_tool_calls;
+  if (chat.temperature !== undefined) out.temperature = chat.temperature;
+  if (chat.top_p !== undefined) out.top_p = chat.top_p;
+  if (typeof chat.user === 'string') out.user = chat.user;
+  if (chat.metadata && typeof chat.metadata === 'object') out.metadata = chat.metadata;
+  if (chat.stream === true) out.stream = true;
+  if (chat.seed !== undefined) out.seed = chat.seed;
+  if (chat.service_tier !== undefined) out.service_tier = chat.service_tier;
+  if (chat.store !== undefined) out.store = chat.store;
+
+  const maxTok = chat.max_completion_tokens ?? chat.max_tokens;
+  if (maxTok !== undefined) out.max_output_tokens = maxTok;
+
+  if (chat.response_format && typeof chat.response_format === 'object') {
+    const rf = chat.response_format;
+    if (rf.type === 'text') out.text = { format: { type: 'text' } };
+    else if (rf.type === 'json_object') out.text = { format: { type: 'json_object' } };
+    else if (rf.type === 'json_schema' && rf.json_schema) {
+      const fmt = {
+        type: 'json_schema',
+        name: rf.json_schema.name,
+        schema: rf.json_schema.schema,
+      };
+      if (rf.json_schema.strict !== undefined) fmt.strict = rf.json_schema.strict;
+      if (rf.json_schema.description) fmt.description = rf.json_schema.description;
+      out.text = { format: fmt };
+    }
+  }
+
+  if (typeof chat.reasoning_effort === 'string') out.reasoning = { effort: chat.reasoning_effort };
+
+  const includeUsage = chat.stream_options?.include_usage !== false;
+
+  return {
+    body: Buffer.from(JSON.stringify(out), 'utf8'),
+    originalModel: typeof chat.model === 'string' ? chat.model : null,
+    stream: chat.stream === true,
+    includeUsage,
+  };
 }
 
-function buildUpstreamHeaders(reqHeaders, host, route) {
+// ---- /v1/chat/completions → Anthropic /v1/messages translation ----
+//
+// When the chat model is claude*, the same OpenAI-shaped request is translated
+// to Anthropic's Messages shape. Scope is text + tools (no vision/images).
+
+// Flatten chat message content to a plain string (text parts only).
+function chatContentToPlainText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((p) => p?.type === 'text' && typeof p.text === 'string')
+      .map((p) => p.text)
+      .join('');
+  }
+  return '';
+}
+
+// Chat content → Anthropic text blocks. Images are dropped (out of scope).
+function chatContentToAnthropicBlocks(content) {
+  if (typeof content === 'string') return content ? [{ type: 'text', text: content }] : [];
+  if (!Array.isArray(content)) return [];
+  const out = [];
+  for (const p of content) {
+    if (p?.type === 'text' && typeof p.text === 'string' && p.text.length) {
+      out.push({ type: 'text', text: p.text });
+    }
+  }
+  return out;
+}
+
+function parseToolArguments(raw) {
+  if (typeof raw === 'string') {
+    try { return JSON.parse(raw || '{}'); } catch { return {}; }
+  }
+  if (raw && typeof raw === 'object') return raw;
+  return {};
+}
+
+function chatToAnthropic(reqBody) {
+  let chat;
+  try {
+    chat = JSON.parse(reqBody.toString('utf8'));
+  } catch (err) {
+    throw new Error(`invalid JSON body: ${err.message}`);
+  }
+  if (!chat || typeof chat !== 'object') throw new Error('body is not an object');
+  if (!Array.isArray(chat.messages)) throw new Error('missing messages array');
+
+  const systemParts = [];
+  // Anthropic requires alternating user/assistant roles, so adjacent messages
+  // that map to the same role (notably tool results, which are user-role blocks)
+  // get merged into a single multi-block turn.
+  const turns = [];
+  const pushBlocks = (role, blocks) => {
+    if (!blocks.length) return;
+    const last = turns[turns.length - 1];
+    if (last && last.role === role) last.content.push(...blocks);
+    else turns.push({ role, content: blocks });
+  };
+
+  for (const msg of chat.messages) {
+    if (!msg || typeof msg !== 'object' || typeof msg.role !== 'string') continue;
+    if (msg.role === 'system' || msg.role === 'developer') {
+      const txt = chatContentToPlainText(msg.content);
+      if (txt) systemParts.push(txt);
+      continue;
+    }
+    if (msg.role === 'user') {
+      pushBlocks('user', chatContentToAnthropicBlocks(msg.content));
+      continue;
+    }
+    if (msg.role === 'assistant') {
+      const blocks = chatContentToAnthropicBlocks(msg.content);
+      if (Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          if (!tc || tc.type !== 'function' || !tc.function) continue;
+          blocks.push({
+            type: 'tool_use',
+            id: tc.id || `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
+            name: tc.function.name,
+            input: parseToolArguments(tc.function.arguments),
+          });
+        }
+      }
+      pushBlocks('assistant', blocks);
+      continue;
+    }
+    if (msg.role === 'tool' || msg.role === 'function') {
+      const toolUseId = typeof msg.tool_call_id === 'string' && msg.tool_call_id
+        ? msg.tool_call_id
+        : `toolu_${createHash('sha256').update(`fn_${msg.name ?? ''}`).digest('hex').slice(0, 24)}`;
+      pushBlocks('user', [{
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: chatContentToPlainText(msg.content),
+      }]);
+    }
+  }
+
+  const out = {};
+  if (typeof chat.model === 'string') out.model = chat.model;
+  // max_tokens is required by Anthropic; chat clients may omit it.
+  out.max_tokens = chat.max_completion_tokens ?? chat.max_tokens ?? DEFAULT_ANTHROPIC_MAX_TOKENS;
+  if (systemParts.length) out.system = systemParts.join('\n\n');
+  out.messages = turns;
+
+  if (Array.isArray(chat.tools)) {
+    const tools = chat.tools
+      .filter((t) => t?.type === 'function' && t.function && typeof t.function.name === 'string')
+      .map((t) => ({
+        name: t.function.name,
+        description: t.function.description,
+        input_schema: t.function.parameters && typeof t.function.parameters === 'object'
+          ? t.function.parameters
+          : { type: 'object', properties: {} },
+      }));
+    if (tools.length) out.tools = tools;
+  }
+
+  if (chat.tool_choice !== undefined && out.tools) {
+    if (chat.tool_choice === 'auto') out.tool_choice = { type: 'auto' };
+    else if (chat.tool_choice === 'required') out.tool_choice = { type: 'any' };
+    // 'none' → omit: Anthropic has no direct "disable" choice short of dropping tools.
+    else if (chat.tool_choice?.type === 'function' && chat.tool_choice.function?.name) {
+      out.tool_choice = { type: 'tool', name: chat.tool_choice.function.name };
+    }
+  }
+
+  if (chat.temperature !== undefined) out.temperature = chat.temperature;
+  if (chat.top_p !== undefined) out.top_p = chat.top_p;
+  if (chat.stream === true) out.stream = true;
+
+  const includeUsage = chat.stream_options?.include_usage !== false;
+
+  return {
+    body: Buffer.from(JSON.stringify(out), 'utf8'),
+    originalModel: typeof chat.model === 'string' ? chat.model : null,
+    stream: chat.stream === true,
+    includeUsage,
+  };
+}
+
+// ---- /v1/chat/completions → Gemini generateContent translation ----
+//
+// When the chat model is gemini*, translate to Gemini's contents shape. The
+// model goes in the URL path, not the body. Text + tools; no vision.
+
+// Gemini's schema validator rejects JSON-Schema keywords it doesn't implement.
+// Strip the ones the OpenAI tool schemas commonly carry.
+function stripGeminiSchema(node) {
+  if (Array.isArray(node)) return node.map(stripGeminiSchema);
+  if (node && typeof node === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(node)) {
+      if (k === 'additionalProperties' || k === '$schema') continue;
+      out[k] = stripGeminiSchema(v);
+    }
+    return out;
+  }
+  return node;
+}
+
+function chatToGemini(reqBody) {
+  let chat;
+  try {
+    chat = JSON.parse(reqBody.toString('utf8'));
+  } catch (err) {
+    throw new Error(`invalid JSON body: ${err.message}`);
+  }
+  if (!chat || typeof chat !== 'object') throw new Error('body is not an object');
+  if (!Array.isArray(chat.messages)) throw new Error('missing messages array');
+
+  const systemParts = [];
+  const contents = [];
+  // Gemini's functionResponse carries the function *name*, not the call id —
+  // map each assistant tool_call id back to its name so tool results resolve.
+  const toolCallNames = new Map();
+  const pushParts = (role, parts) => {
+    if (!parts.length) return;
+    const last = contents[contents.length - 1];
+    if (last && last.role === role) last.parts.push(...parts);
+    else contents.push({ role, parts });
+  };
+
+  for (const msg of chat.messages) {
+    if (!msg || typeof msg !== 'object' || typeof msg.role !== 'string') continue;
+    if (msg.role === 'system' || msg.role === 'developer') {
+      const txt = chatContentToPlainText(msg.content);
+      if (txt) systemParts.push(txt);
+      continue;
+    }
+    if (msg.role === 'user') {
+      const txt = chatContentToPlainText(msg.content);
+      if (txt) pushParts('user', [{ text: txt }]);
+      continue;
+    }
+    if (msg.role === 'assistant') {
+      const parts = [];
+      const txt = chatContentToPlainText(msg.content);
+      if (txt) parts.push({ text: txt });
+      if (Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          if (!tc || tc.type !== 'function' || !tc.function) continue;
+          if (tc.id) toolCallNames.set(tc.id, tc.function.name);
+          parts.push({ functionCall: { name: tc.function.name, args: parseToolArguments(tc.function.arguments) } });
+        }
+      }
+      pushParts('model', parts);
+      continue;
+    }
+    if (msg.role === 'tool' || msg.role === 'function') {
+      const name = (msg.tool_call_id && toolCallNames.get(msg.tool_call_id)) || msg.name || 'tool';
+      const text = chatContentToPlainText(msg.content);
+      let response;
+      try {
+        const parsed = JSON.parse(text);
+        response = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { content: text };
+      } catch {
+        response = { content: text };
+      }
+      pushParts('user', [{ functionResponse: { name, response } }]);
+    }
+  }
+
+  const out = { contents };
+  if (systemParts.length) out.systemInstruction = { parts: systemParts.map((t) => ({ text: t })) };
+
+  if (Array.isArray(chat.tools)) {
+    const decls = chat.tools
+      .filter((t) => t?.type === 'function' && t.function && typeof t.function.name === 'string')
+      .map((t) => {
+        const d = { name: t.function.name };
+        if (t.function.description) d.description = t.function.description;
+        if (t.function.parameters && typeof t.function.parameters === 'object') {
+          d.parameters = stripGeminiSchema(t.function.parameters);
+        }
+        return d;
+      });
+    if (decls.length) out.tools = [{ functionDeclarations: decls }];
+  }
+
+  if (chat.tool_choice !== undefined && out.tools) {
+    const fcc = {};
+    if (chat.tool_choice === 'auto') fcc.mode = 'AUTO';
+    else if (chat.tool_choice === 'required') fcc.mode = 'ANY';
+    else if (chat.tool_choice === 'none') fcc.mode = 'NONE';
+    else if (chat.tool_choice?.type === 'function' && chat.tool_choice.function?.name) {
+      fcc.mode = 'ANY';
+      fcc.allowedFunctionNames = [chat.tool_choice.function.name];
+    }
+    if (fcc.mode) out.toolConfig = { functionCallingConfig: fcc };
+  }
+
+  const genConfig = {};
+  const maxTok = chat.max_completion_tokens ?? chat.max_tokens;
+  if (maxTok !== undefined) genConfig.maxOutputTokens = maxTok;
+  if (chat.temperature !== undefined) genConfig.temperature = chat.temperature;
+  if (chat.top_p !== undefined) genConfig.topP = chat.top_p;
+  if (Object.keys(genConfig).length) out.generationConfig = genConfig;
+
+  const includeUsage = chat.stream_options?.include_usage !== false;
+
+  return {
+    body: Buffer.from(JSON.stringify(out), 'utf8'),
+    originalModel: typeof chat.model === 'string' ? chat.model : null,
+    stream: chat.stream === true,
+    includeUsage,
+    model: typeof chat.model === 'string' ? chat.model : '',
+  };
+}
+
+function responsesJsonToChat(json, originalModel) {
+  if (!json || json.object !== 'response' || !Array.isArray(json.output)) return null;
+
+  const baseId = typeof json.id === 'string' ? json.id.replace(/^resp_/, '') : randomUUID().replace(/-/g, '');
+  const id = `chatcmpl-${baseId}`;
+  const created = typeof json.created_at === 'number' ? json.created_at : Math.floor(Date.now() / 1000);
+  const model = originalModel || json.model || 'unknown';
+
+  let contentText = '';
+  const toolCalls = [];
+  let toolIdx = 0;
+  for (const item of json.output) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.type === 'message' && item.role === 'assistant' && Array.isArray(item.content)) {
+      for (const c of item.content) {
+        if (c?.type === 'output_text' && typeof c.text === 'string') contentText += c.text;
+      }
+    } else if (item.type === 'function_call') {
+      toolCalls.push({
+        id: item.call_id,
+        type: 'function',
+        function: {
+          name: item.name,
+          arguments: typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments ?? {}),
+        },
+        index: toolIdx++,
+      });
+    }
+  }
+
+  // YesCode's codex app-server returns the assistant text in the top-level
+  // `output_text` aggregate while leaving `output[]` empty on non-stream responses.
+  // Fall back to it so chat-completions clients don't receive null content.
+  if (!contentText && typeof json.output_text === 'string') contentText = json.output_text;
+
+  let finishReason;
+  if (toolCalls.length > 0) finishReason = 'tool_calls';
+  else if (json.incomplete_details?.reason === 'max_output_tokens') finishReason = 'length';
+  else if (json.incomplete_details?.reason === 'content_filter') finishReason = 'content_filter';
+  else finishReason = 'stop';
+
+  const message = { role: 'assistant', content: contentText || null };
+  if (toolCalls.length) message.tool_calls = toolCalls;
+
+  const out = {
+    id,
+    object: 'chat.completion',
+    created,
+    model,
+    choices: [{ index: 0, message, finish_reason: finishReason, logprobs: null }],
+  };
+
+  if (json.usage) {
+    const inTok = json.usage.input_tokens ?? 0;
+    const outTok = json.usage.output_tokens ?? 0;
+    out.usage = {
+      prompt_tokens: inTok,
+      completion_tokens: outTok,
+      total_tokens: json.usage.total_tokens ?? (inTok + outTok),
+    };
+    if (json.usage.input_tokens_details) out.usage.prompt_tokens_details = json.usage.input_tokens_details;
+    if (json.usage.output_tokens_details) out.usage.completion_tokens_details = json.usage.output_tokens_details;
+  }
+  if (json.system_fingerprint) out.system_fingerprint = json.system_fingerprint;
+  return out;
+}
+
+function makeJsonTransform({ originalModel, log }) {
+  return {
+    mode: 'json',
+    responseContentType: () => 'application/json; charset=utf-8',
+    stripHeaders: ['content-encoding', 'content-length'],
+    jsonBody(buf) {
+      let json;
+      try {
+        json = JSON.parse(buf.toString('utf8'));
+      } catch (err) {
+        log?.warn?.(`chat-json transform: upstream body not JSON (${err.message})`);
+        return null;
+      }
+      const chat = responsesJsonToChat(json, originalModel);
+      if (!chat) return null;
+      return Buffer.from(JSON.stringify(chat), 'utf8');
+    },
+  };
+}
+
+// ---- Anthropic / Gemini non-stream response → Chat Completions ----
+
+function anthropicJsonToChat(json, originalModel) {
+  if (!json || json.type !== 'message' || !Array.isArray(json.content)) return null;
+  const id = typeof json.id === 'string'
+    ? `chatcmpl-${json.id.replace(/^msg_/, '')}`
+    : `chatcmpl-${randomUUID().replace(/-/g, '')}`;
+  const created = Math.floor(Date.now() / 1000);
+  const model = originalModel || json.model || 'unknown';
+
+  let contentText = '';
+  const toolCalls = [];
+  let toolIdx = 0;
+  for (const block of json.content) {
+    if (!block || typeof block !== 'object') continue;
+    if (block.type === 'text' && typeof block.text === 'string') {
+      contentText += block.text;
+    } else if (block.type === 'tool_use') {
+      toolCalls.push({
+        id: block.id,
+        type: 'function',
+        function: { name: block.name, arguments: JSON.stringify(block.input ?? {}) },
+        index: toolIdx++,
+      });
+    }
+  }
+
+  let finishReason;
+  if (json.stop_reason === 'tool_use') finishReason = 'tool_calls';
+  else if (json.stop_reason === 'max_tokens') finishReason = 'length';
+  else finishReason = 'stop'; // end_turn / stop_sequence / null
+
+  const message = { role: 'assistant', content: contentText || null };
+  if (toolCalls.length) message.tool_calls = toolCalls;
+
+  const out = {
+    id,
+    object: 'chat.completion',
+    created,
+    model,
+    choices: [{ index: 0, message, finish_reason: finishReason, logprobs: null }],
+  };
+  if (json.usage) {
+    const inTok = json.usage.input_tokens ?? 0;
+    const outTok = json.usage.output_tokens ?? 0;
+    out.usage = { prompt_tokens: inTok, completion_tokens: outTok, total_tokens: inTok + outTok };
+  }
+  return out;
+}
+
+function geminiJsonToChat(json, originalModel) {
+  if (!json || !Array.isArray(json.candidates) || json.candidates.length === 0) return null;
+  const cand = json.candidates[0];
+  const id = `chatcmpl-${randomUUID().replace(/-/g, '')}`;
+  const created = Math.floor(Date.now() / 1000);
+  const model = originalModel || json.modelVersion || 'unknown';
+
+  let contentText = '';
+  const toolCalls = [];
+  let toolIdx = 0;
+  const parts = cand?.content?.parts;
+  if (Array.isArray(parts)) {
+    for (const p of parts) {
+      if (!p || typeof p !== 'object') continue;
+      if (typeof p.text === 'string') {
+        contentText += p.text;
+      } else if (p.functionCall) {
+        toolCalls.push({
+          id: `call_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
+          type: 'function',
+          function: { name: p.functionCall.name, arguments: JSON.stringify(p.functionCall.args ?? {}) },
+          index: toolIdx++,
+        });
+      }
+    }
+  }
+
+  let finishReason;
+  if (toolCalls.length) finishReason = 'tool_calls';
+  else if (cand?.finishReason === 'MAX_TOKENS') finishReason = 'length';
+  else if (cand?.finishReason === 'SAFETY' || cand?.finishReason === 'RECITATION') finishReason = 'content_filter';
+  else finishReason = 'stop';
+
+  const message = { role: 'assistant', content: contentText || null };
+  if (toolCalls.length) message.tool_calls = toolCalls;
+
+  const out = {
+    id,
+    object: 'chat.completion',
+    created,
+    model,
+    choices: [{ index: 0, message, finish_reason: finishReason, logprobs: null }],
+  };
+  if (json.usageMetadata) {
+    const inTok = json.usageMetadata.promptTokenCount ?? 0;
+    const outTok = json.usageMetadata.candidatesTokenCount ?? 0;
+    out.usage = {
+      prompt_tokens: inTok,
+      completion_tokens: outTok,
+      total_tokens: json.usageMetadata.totalTokenCount ?? (inTok + outTok),
+    };
+  }
+  return out;
+}
+
+// computeUsage in forwardOnce runs extract*Usage on the *translated* (chat-shaped)
+// body first; that misses native field names, so these transforms stash the native
+// usage and surface it via getCapturedUsage() for the fallback path.
+function makeAnthropicJsonTransform({ originalModel, log }) {
+  let capturedUsage = null;
+  return {
+    mode: 'json',
+    responseContentType: () => 'application/json; charset=utf-8',
+    stripHeaders: ['content-encoding', 'content-length'],
+    jsonBody(buf) {
+      let json;
+      try {
+        json = JSON.parse(buf.toString('utf8'));
+      } catch (err) {
+        log?.warn?.(`anthropic-json transform: upstream body not JSON (${err.message})`);
+        return null;
+      }
+      if (json?.usage) capturedUsage = { input_tokens: json.usage.input_tokens, output_tokens: json.usage.output_tokens };
+      const chat = anthropicJsonToChat(json, originalModel);
+      if (!chat) return null;
+      return Buffer.from(JSON.stringify(chat), 'utf8');
+    },
+    getCapturedUsage() { return capturedUsage; },
+  };
+}
+
+function makeGeminiJsonTransform({ originalModel, log }) {
+  let capturedUsage = null;
+  return {
+    mode: 'json',
+    responseContentType: () => 'application/json; charset=utf-8',
+    stripHeaders: ['content-encoding', 'content-length'],
+    jsonBody(buf) {
+      let json;
+      try {
+        json = JSON.parse(buf.toString('utf8'));
+      } catch (err) {
+        log?.warn?.(`gemini-json transform: upstream body not JSON (${err.message})`);
+        return null;
+      }
+      if (json?.usageMetadata) {
+        capturedUsage = {
+          input_tokens: json.usageMetadata.promptTokenCount,
+          output_tokens: json.usageMetadata.candidatesTokenCount,
+        };
+      }
+      const chat = geminiJsonToChat(json, originalModel);
+      if (!chat) return null;
+      return Buffer.from(JSON.stringify(chat), 'utf8');
+    },
+    getCapturedUsage() { return capturedUsage; },
+  };
+}
+
+// Responses SSE events we intentionally drop. Most are bracket/closure
+// events whose payload duplicates the deltas we already forwarded; the
+// reasoning_summary stream isn't surfaced in Chat Completions at all.
+const KNOWN_IGNORED_SSE_EVENTS = new Set([
+  'response.content_part.added',
+  'response.content_part.done',
+  'response.output_text.done',
+  'response.output_item.done',
+  'response.function_call_arguments.done',
+  'response.refusal.done',
+  'response.reasoning_summary_part.added',
+  'response.reasoning_summary_part.done',
+  'response.reasoning_summary_text.delta',
+  'response.reasoning_summary_text.done',
+  'response.reasoning.delta',
+  'response.reasoning.done',
+]);
+
+// Shared Chat Completions SSE framing for all three upstreams. Owns the chunk
+// envelope, chat id, role prelude, final finish chunk, optional usage chunk and
+// the [DONE] sentinel. Provider transforms drive it via these primitives while
+// keeping their own per-event parsing (tool slots, block indices, etc.).
+function makeChatChunkEmitter({ originalModel, includeUsage }) {
+  let respModel = originalModel || null;
+  let respCreated = null;
+  let chatId = null;
+  let roleEmitted = false;
+  let finishReason = null;
+  let usageFinal = null;
+  let endedCleanly = false;
+
+  const env = (delta, finishReasonChoice = null, extras = {}) => ({
+    id: chatId,
+    object: 'chat.completion.chunk',
+    created: respCreated ?? Math.floor(Date.now() / 1000),
+    model: respModel || 'unknown',
+    choices: [{ index: 0, delta, finish_reason: finishReasonChoice, logprobs: null }],
+    ...extras,
+  });
+
+  const wire = (obj) => Buffer.from(`data: ${JSON.stringify(obj)}\n\n`, 'utf8');
+
+  const ensureChatId = () => {
+    if (!chatId) chatId = `chatcmpl-${randomUUID().replace(/-/g, '')}`;
+  };
+
+  const ensureRolePrelude = (out) => {
+    if (roleEmitted) return;
+    ensureChatId();
+    roleEmitted = true;
+    out.push(wire(env({ role: 'assistant', content: '' })));
+  };
+
+  const flushFinal = (out) => {
+    if (endedCleanly) return;
+    endedCleanly = true;
+    ensureRolePrelude(out);
+    out.push(wire(env({}, finishReason || 'stop')));
+    if (includeUsage && usageFinal) {
+      const inTok = usageFinal.input_tokens ?? 0;
+      const outTok = usageFinal.output_tokens ?? 0;
+      const usage = {
+        prompt_tokens: inTok,
+        completion_tokens: outTok,
+        total_tokens: usageFinal.total_tokens ?? (inTok + outTok),
+      };
+      if (usageFinal.input_tokens_details) usage.prompt_tokens_details = usageFinal.input_tokens_details;
+      if (usageFinal.output_tokens_details) usage.completion_tokens_details = usageFinal.output_tokens_details;
+      out.push(wire({
+        id: chatId,
+        object: 'chat.completion.chunk',
+        created: respCreated ?? Math.floor(Date.now() / 1000),
+        model: respModel || 'unknown',
+        choices: [],
+        usage,
+      }));
+    }
+    out.push(Buffer.from('data: [DONE]\n\n', 'utf8'));
+  };
+
+  return {
+    env,
+    wire,
+    ensureChatId,
+    ensureRolePrelude,
+    flushFinal,
+    setChatId(id) { if (!chatId && id) chatId = id; },
+    setModel(m) { if (m) respModel = m; },
+    setCreated(c) { if (typeof c === 'number') respCreated = c; },
+    setUsage(u) { if (u) usageFinal = u; },
+    setFinishReason(r) { finishReason = r; },
+    getFinishReason() { return finishReason; },
+    isEnded() { return endedCleanly; },
+    getCapturedUsage() { return usageFinal; },
+  };
+}
+
+function makeSSETransform({ originalModel, includeUsage, log }) {
+  const emitter = makeChatChunkEmitter({ originalModel, includeUsage });
+  let leftover = '';
+  let respIdSet = false;
+  const toolSlots = new Map();
+  let nextToolIndex = 0;
+  const warnedUnknown = new Set();
+  let pendingData = [];
+
+  const computeFinishReason = (resp) => {
+    if (toolSlots.size > 0 || (resp && Array.isArray(resp.output) && resp.output.some((it) => it?.type === 'function_call'))) {
+      return 'tool_calls';
+    }
+    const reason = resp?.incomplete_details?.reason;
+    if (reason === 'max_output_tokens') return 'length';
+    if (reason === 'content_filter') return 'content_filter';
+    return 'stop';
+  };
+
+  const handleEvent = (data, out) => {
+    if (!data || typeof data !== 'object') return;
+    const t = data.type;
+    if (t === 'response.created' || t === 'response.in_progress') {
+      const r = data.response;
+      if (r) {
+        if (r.id && !respIdSet) {
+          respIdSet = true;
+          emitter.setChatId(`chatcmpl-${String(r.id).replace(/^resp_/, '')}`);
+        }
+        emitter.setModel(r.model);
+        emitter.setCreated(r.created_at);
+      }
+      return;
+    }
+    emitter.ensureChatId();
+    if (t === 'response.output_item.added') {
+      const item = data.item;
+      if (item?.type === 'function_call') {
+        emitter.ensureRolePrelude(out);
+        const slot = { index: nextToolIndex++, call_id: item.call_id, name: item.name };
+        toolSlots.set(item.id, slot);
+        out.push(emitter.wire(emitter.env({
+          tool_calls: [{
+            index: slot.index,
+            id: slot.call_id,
+            type: 'function',
+            function: { name: slot.name, arguments: '' },
+          }],
+        })));
+      } else if (item?.type === 'message') {
+        emitter.ensureRolePrelude(out);
+      }
+      return;
+    }
+    if (t === 'response.output_text.delta') {
+      emitter.ensureRolePrelude(out);
+      if (typeof data.delta === 'string' && data.delta.length) {
+        out.push(emitter.wire(emitter.env({ content: data.delta })));
+      }
+      return;
+    }
+    if (t === 'response.function_call_arguments.delta') {
+      const slot = toolSlots.get(data.item_id);
+      if (slot && typeof data.delta === 'string') {
+        out.push(emitter.wire(emitter.env({
+          tool_calls: [{ index: slot.index, function: { arguments: data.delta } }],
+        })));
+      }
+      return;
+    }
+    if (t === 'response.refusal.delta') {
+      emitter.ensureRolePrelude(out);
+      if (typeof data.delta === 'string') {
+        out.push(emitter.wire(emitter.env({ refusal: data.delta })));
+      }
+      return;
+    }
+    if (t === 'response.completed' || t === 'response.incomplete' || t === 'response.failed') {
+      const resp = data.response;
+      if (resp?.usage) emitter.setUsage(resp.usage);
+      emitter.setFinishReason(computeFinishReason(resp));
+      emitter.flushFinal(out);
+      return;
+    }
+    if (t === 'error') {
+      log?.warn?.(`upstream SSE error event: ${JSON.stringify(data).slice(0, 200)}`);
+      emitter.setFinishReason(emitter.getFinishReason() || 'stop');
+      emitter.flushFinal(out);
+      return;
+    }
+    if (KNOWN_IGNORED_SSE_EVENTS.has(t)) return;
+    if (t && !warnedUnknown.has(t)) {
+      warnedUnknown.add(t);
+      log?.warn?.(`unknown Responses SSE event type: ${t}`);
+    }
+  };
+
+  return {
+    mode: 'stream',
+    responseContentType: () => 'text/event-stream; charset=utf-8',
+    stripHeaders: ['content-encoding', 'content-length'],
+    streamChunk(chunk) {
+      const out = [];
+      if (chunk === null) {
+        if (pendingData.length > 0) {
+          const payload = pendingData.join('\n');
+          pendingData = [];
+          try { handleEvent(JSON.parse(payload), out); } catch { /* malformed tail */ }
+        }
+        if (!emitter.isEnded()) emitter.flushFinal(out);
+        return out;
+      }
+      leftover += chunk.toString('utf8');
+      let nlIdx;
+      while ((nlIdx = leftover.indexOf('\n')) !== -1) {
+        let line = leftover.slice(0, nlIdx);
+        leftover = leftover.slice(nlIdx + 1);
+        if (line.endsWith('\r')) line = line.slice(0, -1);
+        if (line === '') {
+          if (pendingData.length > 0) {
+            const payload = pendingData.join('\n');
+            pendingData = [];
+            try {
+              handleEvent(JSON.parse(payload), out);
+            } catch (err) {
+              log?.warn?.(`malformed SSE data: ${err.message}`);
+            }
+          }
+        } else if (line.startsWith('data:')) {
+          pendingData.push(line.slice(5).replace(/^ /, ''));
+        }
+        // event:, id:, retry:, comment lines are ignored
+      }
+      return out;
+    },
+    getCapturedUsage() {
+      return emitter.getCapturedUsage();
+    },
+  };
+}
+
+// Shared SSE line buffer → JSON-event dispatcher for the Anthropic/Gemini
+// transforms. The upstream's transform supplies handleEvent(data, out); the
+// line framing, flush, and usage surfacing are identical to the openai path.
+function makeSSEStreamTransform({ emitter, handleEvent, log, label }) {
+  let leftover = '';
+  let pendingData = [];
+  const drain = (out) => {
+    if (pendingData.length === 0) return;
+    const payload = pendingData.join('\n');
+    pendingData = [];
+    try { handleEvent(JSON.parse(payload), out); }
+    catch (err) { log?.warn?.(`malformed ${label} SSE data: ${err.message}`); }
+  };
+  return {
+    mode: 'stream',
+    responseContentType: () => 'text/event-stream; charset=utf-8',
+    stripHeaders: ['content-encoding', 'content-length'],
+    streamChunk(chunk) {
+      const out = [];
+      if (chunk === null) {
+        drain(out);
+        if (!emitter.isEnded()) emitter.flushFinal(out);
+        return out;
+      }
+      leftover += chunk.toString('utf8');
+      let nlIdx;
+      while ((nlIdx = leftover.indexOf('\n')) !== -1) {
+        let line = leftover.slice(0, nlIdx);
+        leftover = leftover.slice(nlIdx + 1);
+        if (line.endsWith('\r')) line = line.slice(0, -1);
+        if (line === '') drain(out);
+        else if (line.startsWith('data:')) pendingData.push(line.slice(5).replace(/^ /, ''));
+        // event:, id:, retry:, comment lines are ignored
+      }
+      return out;
+    },
+    getCapturedUsage() {
+      return emitter.getCapturedUsage();
+    },
+  };
+}
+
+function makeAnthropicSSETransform({ originalModel, includeUsage, log }) {
+  const emitter = makeChatChunkEmitter({ originalModel, includeUsage });
+  const toolSlots = new Map(); // anthropic content-block index -> { index: chat tool index }
+  let nextToolIndex = 0;
+  // Anthropic splits usage across message_start (input) and message_delta (output);
+  // mutate one object so the emitter always holds the merged total.
+  const usage = { input_tokens: null, output_tokens: null };
+
+  const mapStopReason = (reason) => {
+    if (reason === 'tool_use') return 'tool_calls';
+    if (reason === 'max_tokens') return 'length';
+    return 'stop'; // end_turn / stop_sequence
+  };
+
+  const handleEvent = (data, out) => {
+    if (!data || typeof data !== 'object') return;
+    const t = data.type;
+    if (t === 'message_start') {
+      const m = data.message;
+      if (m) {
+        if (m.id) emitter.setChatId(`chatcmpl-${String(m.id).replace(/^msg_/, '')}`);
+        emitter.setModel(m.model);
+        if (m.usage) {
+          if (m.usage.input_tokens != null) usage.input_tokens = m.usage.input_tokens;
+          if (m.usage.output_tokens != null) usage.output_tokens = m.usage.output_tokens;
+          emitter.setUsage(usage);
+        }
+      }
+      emitter.ensureRolePrelude(out);
+      return;
+    }
+    if (t === 'content_block_start') {
+      const cb = data.content_block;
+      if (cb?.type === 'tool_use') {
+        emitter.ensureRolePrelude(out);
+        const slot = { index: nextToolIndex++ };
+        toolSlots.set(data.index, slot);
+        out.push(emitter.wire(emitter.env({
+          tool_calls: [{ index: slot.index, id: cb.id, type: 'function', function: { name: cb.name, arguments: '' } }],
+        })));
+      } else if (cb?.type === 'text') {
+        emitter.ensureRolePrelude(out);
+      }
+      return;
+    }
+    if (t === 'content_block_delta') {
+      const d = data.delta;
+      if (d?.type === 'text_delta' && typeof d.text === 'string' && d.text.length) {
+        emitter.ensureRolePrelude(out);
+        out.push(emitter.wire(emitter.env({ content: d.text })));
+      } else if (d?.type === 'input_json_delta' && typeof d.partial_json === 'string') {
+        const slot = toolSlots.get(data.index);
+        if (slot) {
+          out.push(emitter.wire(emitter.env({
+            tool_calls: [{ index: slot.index, function: { arguments: d.partial_json } }],
+          })));
+        }
+      }
+      return;
+    }
+    if (t === 'message_delta') {
+      if (data.delta?.stop_reason) emitter.setFinishReason(mapStopReason(data.delta.stop_reason));
+      if (data.usage?.output_tokens != null) {
+        usage.output_tokens = data.usage.output_tokens;
+        emitter.setUsage(usage);
+      }
+      return;
+    }
+    if (t === 'message_stop') {
+      emitter.flushFinal(out);
+      return;
+    }
+    if (t === 'error') {
+      log?.warn?.(`anthropic SSE error event: ${JSON.stringify(data).slice(0, 200)}`);
+      emitter.setFinishReason(emitter.getFinishReason() || 'stop');
+      emitter.flushFinal(out);
+      return;
+    }
+    // ping, content_block_stop, etc. → ignore
+  };
+
+  return makeSSEStreamTransform({ emitter, handleEvent, log, label: 'anthropic' });
+}
+
+function makeGeminiSSETransform({ originalModel, includeUsage, log }) {
+  const emitter = makeChatChunkEmitter({ originalModel, includeUsage });
+  let nextToolIndex = 0;
+  const usage = { input_tokens: null, output_tokens: null, total_tokens: null };
+
+  const mapFinish = (reason) => {
+    if (reason === 'MAX_TOKENS') return 'length';
+    if (reason === 'SAFETY' || reason === 'RECITATION') return 'content_filter';
+    return 'stop';
+  };
+
+  const handleEvent = (data, out) => {
+    if (!data || typeof data !== 'object') return;
+    if (data.modelVersion) emitter.setModel(data.modelVersion);
+    emitter.ensureChatId();
+    if (data.usageMetadata) {
+      if (data.usageMetadata.promptTokenCount != null) usage.input_tokens = data.usageMetadata.promptTokenCount;
+      if (data.usageMetadata.candidatesTokenCount != null) usage.output_tokens = data.usageMetadata.candidatesTokenCount;
+      if (data.usageMetadata.totalTokenCount != null) usage.total_tokens = data.usageMetadata.totalTokenCount;
+      emitter.setUsage(usage);
+    }
+    const cand = Array.isArray(data.candidates) ? data.candidates[0] : null;
+    if (!cand) return;
+    const parts = cand.content?.parts;
+    if (Array.isArray(parts)) {
+      for (const p of parts) {
+        if (!p || typeof p !== 'object') continue;
+        if (typeof p.text === 'string' && p.text.length) {
+          emitter.ensureRolePrelude(out);
+          out.push(emitter.wire(emitter.env({ content: p.text })));
+        } else if (p.functionCall) {
+          // Gemini emits the whole functionCall in one chunk — name + args together.
+          emitter.ensureRolePrelude(out);
+          out.push(emitter.wire(emitter.env({
+            tool_calls: [{
+              index: nextToolIndex++,
+              id: `call_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
+              type: 'function',
+              function: { name: p.functionCall.name, arguments: JSON.stringify(p.functionCall.args ?? {}) },
+            }],
+          })));
+        }
+      }
+    }
+    if (cand.finishReason) {
+      emitter.setFinishReason(nextToolIndex > 0 ? 'tool_calls' : mapFinish(cand.finishReason));
+    }
+  };
+
+  return makeSSEStreamTransform({ emitter, handleEvent, log, label: 'gemini' });
+}
+
+function buildUpstreamHeaders(reqHeaders, host, route, key) {
   const out = {};
   for (const [name, value] of Object.entries(reqHeaders)) {
     if (HOP_BY_HOP.has(name.toLowerCase())) continue;
@@ -419,7 +1674,15 @@ function buildUpstreamHeaders(reqHeaders, host, route) {
   }
   out.host = host;
 
-  const key = keyForRoute(route);
+  // The proxy owns the client fingerprint on every upstream (claude-cli for the
+  // anthropic backend, codex for openai). The caller's own SDK telemetry
+  // (x-stainless-*) must never be forwarded: YesCode validates these on
+  // /v1/messages and rejects a foreign-SDK fingerprint (e.g. the OpenAI JS SDK's)
+  // with a misleading 503 "no capacity available within your access scope". The
+  // anthropic fullFingerprint branch re-adds the correct set below.
+  for (const k of Object.keys(out)) {
+    if (k.toLowerCase().startsWith('x-stainless-')) delete out[k];
+  }
 
   if (route === 'anthropic') {
     for (const k of Object.keys(out)) {
@@ -451,37 +1714,93 @@ function buildUpstreamHeaders(reqHeaders, host, route) {
   for (const k of Object.keys(out)) {
     const lower = k.toLowerCase();
     if (lower === 'authorization' || lower === 'x-api-key') delete out[k];
+    if (lower === 'user-agent'
+      && (route === 'openai' || route === 'openai-chat' || route === 'gemini')) delete out[k];
+    if (lower === 'originator' && (route === 'openai' || route === 'openai-chat')) delete out[k];
   }
   if (key) {
     out['authorization'] = `Bearer ${key}`;
     out['x-api-key'] = key;
   }
+  // YesCode routes codex models to the real app-server only when the UA looks like
+  // a codex client; otherwise /v1/responses 503s. See codexUserAgent in loadConfig.
+  if (route === 'openai' || route === 'openai-chat') {
+    out['user-agent'] = config.codexUserAgent;
+    out['originator'] = config.codexOriginator;
+  }
+  // YesCode's gemini upstream 403s on competing-SDK user-agents. See geminiUserAgent.
+  if (route === 'gemini') {
+    out['user-agent'] = config.geminiUserAgent;
+  }
   return out;
 }
 
-function copyResponseHeaders(upstreamHeaders) {
+function copyResponseHeaders(upstreamHeaders, stripExtra) {
   const out = {};
   for (const [name, value] of Object.entries(upstreamHeaders)) {
-    if (HOP_BY_HOP.has(name.toLowerCase())) continue;
+    const lower = name.toLowerCase();
+    if (HOP_BY_HOP.has(lower)) continue;
+    if (stripExtra && stripExtra.includes(lower)) continue;
     out[name] = value;
   }
   return out;
 }
 
-function forwardOnce({ host, method, path, headers, body, res, route, log }) {
+function forwardOnce({ host, port = 443, protocol = 'https:', method, path, headers, body, res, route, log, transform = null, credential = null, heldStatuses = [] }) {
   return new Promise((resolve, reject) => {
     const upstreamHeaders = {
-      ...buildUpstreamHeaders(headers, host, route),
+      ...buildUpstreamHeaders(headers, host, route, credential?.key),
       'content-length': Buffer.byteLength(body),
     };
-    const upstreamReq = httpsRequest({
+    if (transform) {
+      // We're rewriting the body, so an upstream-applied content-encoding
+      // (gzip etc.) would leave us unable to parse. Force identity.
+      upstreamHeaders['accept-encoding'] = 'identity';
+      if (transform.mode === 'stream') upstreamHeaders['accept'] = 'text/event-stream';
+      else if (transform.mode === 'json') upstreamHeaders['accept'] = 'application/json';
+    }
+    const requestFn = protocol === 'http:' ? httpRequest : httpsRequest;
+    const upstreamReq = requestFn({
       host,
-      port: 443,
+      port,
       method,
       path,
       headers: upstreamHeaders,
       timeout: config.upstreamTimeoutMs,
     }, (upstreamRes) => {
+      const status = upstreamRes.statusCode ?? 502;
+      const ct = String(upstreamRes.headers['content-type'] ?? '').toLowerCase();
+      const ok = status >= 200 && status < 300;
+      // Decide whether to engage the transform. Errors / mismatched
+      // content-types fall through to passthrough so upstream error bodies
+      // reach the client untouched.
+      let mode = 'passthrough';
+      if (transform && ok) {
+        if (transform.mode === 'stream' && ct.startsWith('text/event-stream')) mode = 'stream';
+        else if (transform.mode === 'json' && ct.includes('application/json')) mode = 'json';
+      }
+
+      // Key-failure status with a fallback credential still to try: swallow the
+      // (small, passthrough) error body without touching the client response, so
+      // the caller can retry with the next credential. Only reached when the
+      // caller passed a non-empty heldStatuses, which it does only while a next
+      // credential exists — so a held result always leads to a retry, never a
+      // dangling un-flushed response.
+      if (heldStatuses.includes(status)) {
+        let held = 0;
+        const heldChunks = [];
+        upstreamRes.on('data', (chunk) => {
+          held += chunk.length;
+          if (config.debugBodies) heldChunks.push(chunk);
+        });
+        upstreamRes.on('end', () => {
+          if (config.debugBodies) log.info(`   resp.held[${status}] ${previewBody(Buffer.concat(heldChunks))}`);
+          resolve({ status, bytes: held, held: true });
+        });
+        upstreamRes.on('error', (err) => resolve({ status, bytes: held, held: true, streamError: err }));
+        return;
+      }
+
       let bytes = 0;
       // Bounded capture for usage extraction. JSON responses parse fully if
       // they fit; SSE keeps a rolling tail since the final usage event lives
@@ -490,41 +1809,140 @@ function forwardOnce({ host, method, path, headers, body, res, route, log }) {
       const MAX_CAPTURE = 256 * 1024;
       const captureChunks = [];
       let captureSize = 0;
-      try {
-        res.writeHead(upstreamRes.statusCode ?? 502, copyResponseHeaders(upstreamRes.headers));
-      } catch (err) {
-        upstreamRes.destroy();
-        reject(err);
-        return;
-      }
-      upstreamRes.on('data', (chunk) => {
-        bytes += chunk.length;
+      const captureChunk = (chunk) => {
         captureChunks.push(chunk);
         captureSize += chunk.length;
         while (captureSize > MAX_CAPTURE && captureChunks.length > 1) {
           captureSize -= captureChunks.shift().length;
         }
+      };
+      const computeUsage = () => {
+        if (captureChunks.length) {
+          const buf = Buffer.concat(captureChunks);
+          const u = extractJSONUsage(buf, route) ?? extractSSEUsage(buf, route);
+          if (u) return u;
+        }
+        if (transform && transform.getCapturedUsage) {
+          const u = transform.getCapturedUsage();
+          if (u) return formatUsageParts({ in: u.input_tokens, out: u.output_tokens });
+        }
+        return null;
+      };
+
+      if (mode === 'json') {
+        const collected = [];
+        upstreamRes.on('data', (chunk) => {
+          bytes += chunk.length;
+          collected.push(chunk);
+        });
+        upstreamRes.on('end', () => {
+          const raw = Buffer.concat(collected);
+          let outBuf = raw;
+          let transformed = null;
+          try {
+            transformed = transform.jsonBody(raw);
+          } catch (err) {
+            log.warn(`json transform error: ${err.message}`);
+          }
+          if (transformed) outBuf = transformed;
+          const hdrs = transformed
+            ? {
+              ...copyResponseHeaders(upstreamRes.headers, transform.stripHeaders),
+              'content-type': transform.responseContentType?.() ?? 'application/json; charset=utf-8',
+              'content-length': Buffer.byteLength(outBuf),
+            }
+            : copyResponseHeaders(upstreamRes.headers);
+          try {
+            res.writeHead(status, hdrs);
+          } catch (err) {
+            reject(err);
+            return;
+          }
+          res.end(outBuf);
+          captureChunk(outBuf);
+          if (config.debugBodies) log.info(`   resp.upstream[${status}] ${previewBody(raw)}`);
+          resolve({ status, bytes, usage: computeUsage() });
+        });
+        upstreamRes.on('error', (err) => {
+          log.warn(`upstream stream error from ${host}: ${err.message}`);
+          if (!res.writableEnded) res.end();
+          resolve({ status, bytes, usage: null, streamError: err });
+        });
+        return;
+      }
+
+      const downstreamHeaders = copyResponseHeaders(upstreamRes.headers, transform?.stripHeaders);
+      if (mode === 'stream') {
+        const ovr = transform.responseContentType?.();
+        if (ovr) downstreamHeaders['content-type'] = ovr;
+      }
+      try {
+        res.writeHead(status, downstreamHeaders);
+      } catch (err) {
+        upstreamRes.destroy();
+        reject(err);
+        return;
+      }
+
+      if (mode === 'stream') {
+        upstreamRes.on('data', (chunk) => {
+          bytes += chunk.length;
+          let pieces;
+          try {
+            pieces = transform.streamChunk(chunk);
+          } catch (err) {
+            log.warn(`sse transform error: ${err.message}`);
+            return;
+          }
+          for (const piece of pieces) {
+            captureChunk(piece);
+            if (!res.write(piece)) upstreamRes.pause();
+          }
+        });
+        res.on('drain', () => upstreamRes.resume());
+        upstreamRes.on('end', () => {
+          let tail = [];
+          try {
+            tail = transform.streamChunk(null);
+          } catch (err) {
+            log.warn(`sse transform flush error: ${err.message}`);
+          }
+          for (const piece of tail) {
+            captureChunk(piece);
+            res.write(piece);
+          }
+          res.end();
+          if (config.debugBodies) log.info(`   resp.stream-out[${status}] ${previewBody(Buffer.concat(captureChunks))}`);
+          resolve({ status, bytes, usage: computeUsage() });
+        });
+        upstreamRes.on('error', (err) => {
+          log.warn(`upstream stream error from ${host}: ${err.message}`);
+          let tail = [];
+          try { tail = transform.streamChunk(null); } catch { /* swallow */ }
+          for (const piece of tail) {
+            if (!res.writableEnded) res.write(piece);
+          }
+          if (!res.writableEnded) res.end();
+          resolve({ status, bytes, usage: computeUsage(), streamError: err });
+        });
+        return;
+      }
+
+      upstreamRes.on('data', (chunk) => {
+        bytes += chunk.length;
+        captureChunk(chunk);
         if (!res.write(chunk)) upstreamRes.pause();
       });
       res.on('drain', () => upstreamRes.resume());
       upstreamRes.on('end', () => {
         res.end();
-        let usage = null;
-        if (captureChunks.length) {
-          const buf = Buffer.concat(captureChunks);
-          usage = extractJSONUsage(buf, route) ?? extractSSEUsage(buf, route);
-        }
-        resolve({ status: upstreamRes.statusCode ?? 0, bytes, usage });
+        if (config.debugBodies) log.info(`   resp.upstream[${status}] ${previewBody(Buffer.concat(captureChunks))}`);
+        resolve({ status, bytes, usage: computeUsage() });
       });
       upstreamRes.on('error', (err) => {
         log.warn(`upstream stream error from ${host}: ${err.message}`);
         if (!res.writableEnded) res.end();
-        let usage = null;
-        if (captureChunks.length) {
-          const buf = Buffer.concat(captureChunks);
-          usage = extractJSONUsage(buf, route) ?? extractSSEUsage(buf, route);
-        }
-        resolve({ status: upstreamRes.statusCode ?? 0, bytes, usage, streamError: err });
+        resolve({ status, bytes, usage: computeUsage(), streamError: err });
       });
     });
 
@@ -542,6 +1960,7 @@ function shouldRetryUpstream(err, headersSent) {
   if (headersSent) return false;
   if (!err) return false;
   const code = err.code ?? '';
+  const msg = err.message ?? '';
   return [
     'ECONNRESET',
     'ECONNREFUSED',
@@ -551,8 +1970,14 @@ function shouldRetryUpstream(err, headersSent) {
     'EHOSTUNREACH',
     'ENETUNREACH',
     'EPIPE',
-  ].includes(code) || /timeout/i.test(err.message ?? '');
+  ].includes(code) || /timeout|socket hang up|socket disconnected|TLS|certificate/i.test(msg);
 }
+
+// Backoff schedule (ms) for retrying the primary host on transient failures —
+// connection-level errors (socket hang up, ECONNRESET, timeouts) and transient
+// upstream statuses (config.retryStatuses). After these the fallback host gets
+// one shot. Module-scoped so the startup banner can print it.
+const PRIMARY_BACKOFFS_MS = [200, 600];
 
 const server = createServer(async (req, res) => {
   const reqId = shortId();
@@ -566,13 +1991,13 @@ const server = createServer(async (req, res) => {
 
   if (req.url === '/health' || req.url === '/healthz') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, primary: config.primaryHost, fallback: config.fallbackHost }));
+    res.end(JSON.stringify({ ok: true, primary: config.primary.host, fallback: config.fallback.host }));
     return;
   }
 
   if (req.method === 'GET' && (req.url === '/' || req.url === '/index')) {
     res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-    res.end(`yescode-proxy listening on ${BOOT_BIND}:${BOOT_PORT}\nupstream: ${config.primaryHost} (fallback: ${config.fallbackHost})\n`);
+    res.end(`yescode-proxy listening on ${BOOT_BIND}:${BOOT_PORT}\nupstream: ${config.primary.host}${config.primary.prefix} (fallback: ${config.fallback.host}${config.fallback.prefix})\n`);
     return;
   }
 
@@ -581,7 +2006,7 @@ const server = createServer(async (req, res) => {
     res.writeHead(404, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
       error: {
-        message: `path "${req.url}" is not a yescode-compatible route. Use /v1/* (OpenAI), /v1/messages (Anthropic), or /gemini/* (Gemini).`,
+        message: `path "${req.url}" is not a yescode-compatible route. Use /v1/chat/completions or /v1/responses (OpenAI), /v1/messages (Anthropic), or /v1beta/* (Gemini).`,
         type: 'not_found',
       },
     }));
@@ -600,42 +2025,162 @@ const server = createServer(async (req, res) => {
 
   const { model: modelRaw, maxTokens, stream } = extractReqMeta(body, req.url ?? '/', route);
   const model = modelRaw ?? '?';
+  // Original client body, before translation/injection rewrites `body`.
+  const rawClientBody = body;
 
+  // /v1/chat/completions is universal: the model-name prefix picks the upstream
+  // provider. Every other route maps 1:1 to its own provider.
+  const upstreamRoute = route === 'openai-chat' ? providerForModel(model) : route;
+
+  // Clients use Gemini's native `/v1beta/...` path, but YesCode serves Gemini
+  // under `<prefix>/gemini/v1beta/...` — re-insert the `/gemini` segment upstream.
+  // (Without it the upstream falls through to YesCode's web app, 200 + HTML.)
+  // upstreamPath is prefix-less here; each attempt prepends its upstream's prefix.
+  let upstreamPath = route === 'gemini'
+    ? `/gemini${req.url ?? '/'}`
+    : `${req.url ?? '/'}`;
+  let transform = null;
+  let translatedFrom = null;
+
+  if (route === 'openai-chat') {
+    try {
+      if (upstreamRoute === 'anthropic') {
+        const translated = chatToAnthropic(body);
+        body = translated.body;
+        upstreamPath = `/v1/messages`;
+        transform = translated.stream
+          ? makeAnthropicSSETransform({ originalModel: translated.originalModel, includeUsage: translated.includeUsage, log })
+          : makeAnthropicJsonTransform({ originalModel: translated.originalModel, log });
+      } else if (upstreamRoute === 'gemini') {
+        const translated = chatToGemini(body);
+        body = translated.body;
+        // Gemini puts the model in the path; streaming uses a different verb + ?alt=sse.
+        const verb = translated.stream ? 'streamGenerateContent?alt=sse' : 'generateContent';
+        upstreamPath = `/gemini/v1beta/models/${translated.model}:${verb}`;
+        transform = translated.stream
+          ? makeGeminiSSETransform({ originalModel: translated.originalModel, includeUsage: translated.includeUsage, log })
+          : makeGeminiJsonTransform({ originalModel: translated.originalModel, log });
+      } else {
+        const translated = chatToResponses(body);
+        body = translated.body;
+        upstreamPath = `/v1/responses`;
+        transform = translated.stream
+          ? makeSSETransform({ originalModel: translated.originalModel, includeUsage: translated.includeUsage, log })
+          : makeJsonTransform({ originalModel: translated.originalModel, log });
+      }
+    } catch (err) {
+      log.warn(`chat->${upstreamRoute} translation failed: ${err.message}`);
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        error: {
+          message: `invalid chat completion request: ${err.message}`,
+          type: 'invalid_request_error',
+        },
+      }));
+      return;
+    }
+    translatedFrom = '/v1/chat/completions';
+  }
+
+  // Inject the Claude-CLI fingerprint for anything bound for Anthropic — native
+  // /v1/messages or a chat/completions request translated to messages. Runs after
+  // translation so the metadata lands on the final upstream body.
   let injected = false;
-  if (route === 'anthropic') {
+  let systemInjected = false;
+  if (upstreamRoute === 'anthropic') {
     const result = injectClaudeMetadata(body);
     body = result.body;
     injected = result.injected;
+    systemInjected = result.systemInjected;
   }
 
-  log.info(`-> ${req.method} ${req.url} route=${route} model=${model} stream=${stream} bytes=${body.length}${maxTokens != null ? ` max_tokens=${maxTokens}` : ''}${injected ? ' user_id=injected' : ''}`);
+  log.info(`-> ${req.method} ${req.url} route=${route} upstream=${upstreamRoute} model=${model} stream=${stream} bytes=${body.length}${maxTokens != null ? ` max_tokens=${maxTokens}` : ''}${injected ? ' user_id=injected' : ''}${systemInjected ? ' system=injected' : ''}${translatedFrom ? ` translated=${translatedFrom}→${upstreamPath}` : ''}`);
 
-  const upstreamPath = `${config.pathPrefix}${req.url ?? '/'}`;
-  const hosts = [config.primaryHost, config.fallbackHost];
+  if (config.debugBodies) {
+    log.info(`   req.headers ${JSON.stringify(redactHeaders(req.headers))}`);
+    if (translatedFrom) log.info(`   req.client-body ${previewBody(rawClientBody)}`);
+    log.info(`   req.upstream-body ${previewBody(body)}`);
+  }
+
+  // Attempt schedule: primary upstream first, then the same upstream on each
+  // backoff delay, then the fallback upstream once. Drives both connection-error
+  // retries and transient-status retries (the held/continue path below). Each
+  // upstream carries its own protocol/host/port/prefix (see loadConfig).
+  const attempts = [
+    { upstream: config.primary, delayMs: 0 },
+    ...PRIMARY_BACKOFFS_MS.map((delayMs) => ({ upstream: config.primary, delayMs })),
+    { upstream: config.fallback, delayMs: 0 },
+  ];
 
   let lastErr;
-  for (const host of hosts) {
-    try {
-      const result = await forwardOnce({
-        host,
-        method: req.method ?? 'POST',
-        path: upstreamPath,
-        headers: req.headers,
-        body,
-        res,
-        route,
-        log,
-      });
-      const ms = (performance.now() - startedAt).toFixed(0);
-      log.info(`<- ${result.status} ${ms}ms via=${host}${upstreamPath} bytes=${result.bytes}${result.usage ? ` ${result.usage}` : ''}${result.streamError ? ` streamError=${result.streamError.message}` : ''}`);
-      return;
-    } catch (err) {
-      lastErr = err;
-      const ms = (performance.now() - startedAt).toFixed(0);
-      log.warn(`upstream ${host}${upstreamPath} failed (${ms}ms): ${err.message ?? err}`);
-      if (!shouldRetryUpstream(err, res.headersSent)) break;
-      log.info(`retrying via fallback host`);
+  const credentials = credentialsForRoute(upstreamRoute);
+  for (let ci = 0; ci < credentials.length; ci += 1) {
+    const cred = credentials[ci];
+    const hasNextCred = ci < credentials.length - 1;
+    let fellBack = false;
+    let attemptIdx = 0;
+
+    for (const { upstream, delayMs } of attempts) {
+      attemptIdx += 1;
+      const { host } = upstream;
+      const fullPath = `${upstream.prefix}${upstreamPath}`;
+      const hasNextAttempt = attemptIdx < attempts.length;
+      // Hold (swallow without flushing) any status we can still act on: key-failure
+      // statuses while a fallback credential remains (→ switch key), transient 5xx/429
+      // while a retry attempt remains (→ retry same key). The final attempt of the
+      // final credential holds nothing, so the real response reaches the client.
+      const heldStatuses = [
+        ...(hasNextCred ? config.keyFallbackStatuses : []),
+        ...(hasNextAttempt ? config.retryStatuses : []),
+      ];
+      if (delayMs > 0) {
+        log.info(`retrying ${host} in ${delayMs}ms (attempt ${attemptIdx}/${attempts.length}, key=${cred.label})`);
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+      try {
+        const result = await forwardOnce({
+          host,
+          port: upstream.port,
+          protocol: upstream.protocol,
+          method: req.method ?? 'POST',
+          path: fullPath,
+          headers: req.headers,
+          body,
+          res,
+          route: upstreamRoute,
+          log,
+          transform,
+          credential: cred,
+          heldStatuses,
+        });
+        const ms = (performance.now() - startedAt).toFixed(0);
+        if (result.held) {
+          // Key-failure → advance to the next credential. Transient → retry the
+          // same credential on the next (backed-off) attempt.
+          if (hasNextCred && config.keyFallbackStatuses.includes(result.status)) {
+            const next = credentials[ci + 1];
+            log.info(`<- ${result.status} ${ms}ms via=${host}${fullPath} key=${cred.label} bytes=${result.bytes} rejected → fallback to ${next.label} key`);
+            fellBack = true;
+            break;
+          }
+          log.info(`<- ${result.status} ${ms}ms via=${host}${fullPath} key=${cred.label} bytes=${result.bytes} transient → retry (attempt ${attemptIdx}/${attempts.length})`);
+          continue;
+        }
+        log.info(`<- ${result.status} ${ms}ms via=${host}${fullPath} key=${cred.label} bytes=${result.bytes}${result.usage ? ` ${result.usage}` : ''}${result.streamError ? ` streamError=${result.streamError.message}` : ''}`);
+        return;
+      } catch (err) {
+        lastErr = err;
+        const ms = (performance.now() - startedAt).toFixed(0);
+        log.warn(`upstream ${host}${fullPath} failed (${ms}ms, key=${cred.label}): ${err.message ?? err}`);
+        if (!shouldRetryUpstream(err, res.headersSent)) break;
+      }
     }
+
+    // Advance to the next credential only when the current key was rejected with
+    // a key-failure status. Network exhaustion or exhausted transient retries aren't
+    // a key problem — give up so we don't burn a fallback key on an unreachable or
+    // at-capacity upstream.
+    if (!fellBack) break;
   }
 
   if (!res.headersSent) {
@@ -660,13 +2205,20 @@ server.on('clientError', (err, socket) => {
 
 server.listen(BOOT_PORT, BOOT_BIND, () => {
   console.log(`${timestamp()} yescode-proxy listening on http://${BOOT_BIND}:${BOOT_PORT}`);
-  console.log(`${timestamp()} upstream primary=${config.primaryHost}${config.pathPrefix} fallback=${config.fallbackHost}${config.pathPrefix}`);
-  const slots = [];
-  if (config.apiKeyAnthropic) slots.push('anthropic');
-  if (config.apiKeyOpenai) slots.push('openai');
-  if (config.apiKeyGemini) slots.push('gemini');
-  if (config.apiKey) slots.push('fallback');
-  console.log(`${timestamp()} api-key injection: ${slots.length ? slots.join(', ') : 'disabled — clients must supply Authorization/x-api-key'}`);
+  console.log(`${timestamp()} upstream primary=${config.primary.host}${config.primary.prefix} fallback=${config.fallback.host}${config.fallback.prefix}`);
+  const fallbacks = [];
+  if (config.apiKeyAnthropic) fallbacks.push('anthropic');
+  if (config.apiKeyOpenai) fallbacks.push('openai');
+  if (config.apiKeyGemini) fallbacks.push('gemini');
+  if (!config.apiKey && fallbacks.length === 0) {
+    console.log(`${timestamp()} api-key injection: disabled — clients must supply Authorization/x-api-key`);
+  } else {
+    const fbDesc = fallbacks.length
+      ? `${fallbacks.join(', ')} (retry on ${config.keyFallbackStatuses.join('/')})`
+      : 'none';
+    console.log(`${timestamp()} key chain: primary=${config.apiKey ? 'team' : '(none)'} fallbacks=${fbDesc}`);
+  }
+  console.log(`${timestamp()} transient retry: ${config.retryStatuses.join('/')} (backoff ${PRIMARY_BACKOFFS_MS.join('/')}ms, then fallback host)`);
   console.log(`${timestamp()} hot-reload: SIGHUP (systemctl reload) + watching ${ENV_FILE_PATH}`);
 });
 

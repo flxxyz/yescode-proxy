@@ -2,7 +2,21 @@ English | [中文](README.md)
 
 # yescode-proxy
 
-HTTP reverse proxy fronting **co.yes.vg** (YesCode) for OpenClaw. Handles three routes — `/v1/messages` (Anthropic), `/v1/*` (OpenAI), `/gemini/*` (Google) — strips client-supplied auth, injects the configured YesCode key, and (for Anthropic) rewrites the `metadata.user_id` + headers to pass YesCode's Claude-CLI fingerprint gate. Falls back from `co.yes.vg` to `co-cdn.yes.vg` on transient errors.
+HTTP reverse proxy fronting **co.yes.vg** (YesCode) for OpenClaw. Handles three routes — `/v1/messages` (Anthropic), `/v1/*` (OpenAI), `/v1beta/*` (Gemini) — strips client-supplied auth, injects the configured YesCode key, and (for Anthropic) rewrites the `metadata.user_id` + headers to pass YesCode's Claude-CLI fingerprint gate. Falls back from `co.yes.vg` to `co-cdn.yes.vg` on transient errors. When the upstream rejects the primary key with `401/403`, it retries the same request with that route's fallback key (see `YESCODE_API_KEY_*`). On transient upstream statuses (`429/503/529`) it retries the same request with backoff, then the fallback host, before surfacing the error (see `YESCODE_RETRY_STATUSES`).
+
+**`/v1/chat/completions` is a universal endpoint.** The `model` name prefix selects the upstream backend; the proxy translates both the request and the response (JSON or SSE stream) in each direction, so an OpenAI Chat Completions client can drive Claude, Gemini, or OpenAI models without switching protocol:
+
+| `model` prefix | Upstream | Upstream endpoint |
+|---|---|---|
+| `claude*` | Anthropic | `/v1/messages` |
+| `gemini*` | Gemini | `/v1beta/models/{model}:generateContent` |
+| else (`gpt*`, `o*`, `*codex*`, unknown) | OpenAI | `/v1/responses` |
+
+Translation covers system messages, multi-turn text, streaming, and `tools` / `tool_calls` / `tool`-role round-trip in both directions. Credential selection and the upstream fingerprint (Claude-CLI `metadata.user_id`, codex `User-Agent`) follow the **resolved** backend, not the URL — a `claude*` model here gets the same fingerprint as the native `/v1/messages` route. **Vision/images are not supported cross-protocol**: the OpenAI path still accepts `image_url`, but the Claude/Gemini paths drop image parts. Anthropic requires `max_tokens`, so the Claude path defaults it to `4096` when the request sets neither `max_tokens` nor `max_completion_tokens`. The OpenAI path additionally maps `max_completion_tokens`, `response_format`, `reasoning_effort`. Non-2xx upstream errors pass through untouched.
+
+The three native routes — `/v1/messages`, `/v1/responses`, `/v1beta/*` — stay plain passthrough (auth swap + fingerprint only, no body translation); call them directly to bypass translation entirely.
+
+YesCode gates the codex models (`gpt-5.x` / `*-codex` on `/v1/responses`) behind a `User-Agent` prefix check: only a UA that looks like a codex client is routed to the real Codex app-server, otherwise the request falls through to an unconfigured path that returns `503 "Codex app-server responses fallback is not configured"`. So the proxy spoofs a codex `User-Agent` on the OpenAI route (see `YESCODE_CODEX_*`) to make `gpt-5.x` work — the same idea as the Claude-CLI fingerprint on the Anthropic route. `originator` is sent for fidelity but isn't part of the gate.
 
 Listens on `127.0.0.1:18790` by default. Single-file ESM script, no runtime deps.
 
@@ -119,14 +133,19 @@ Copy `.env.example` to `.env` and fill in. All keys are hot-reloadable except `P
 |---|---|---|
 | `PORT` | `18790` | Listen port (restart only). |
 | `BIND` | `127.0.0.1` | Listen address (restart only). |
-| `YESCODE_PRIMARY` | `co.yes.vg` | Primary upstream. |
-| `YESCODE_FALLBACK` | `co-cdn.yes.vg` | Fallback when primary returns a retriable network error. |
-| `YESCODE_PATH_PREFIX` | _empty_ | Prefix prepended to every upstream URL. `/team` for team accounts, blank for personal. |
-| `YESCODE_API_KEY` | _empty_ | Unified key for all three routes. Force-overrides client-supplied auth. |
-| `YESCODE_API_KEY_ANTHROPIC` / `_OPENAI` / `_GEMINI` | _empty_ | Per-route overrides; fall back to `YESCODE_API_KEY`. |
-| `YESCODE_TIMEOUT_MS` | `3600000` | Upstream request timeout (ms). Default 1h to fit long agent runs. |
+| `YESCODE_PRIMARY_URL` | `https://co.yes.vg/team` | Primary upstream as a full URL (scheme + host + optional path prefix). The scheme picks http/https, `host[:port]` addresses the socket, and the path becomes a prefix prepended to every route. Keep `/team` for team accounts, drop it for personal (e.g. `https://co.yes.vg`). |
+| `YESCODE_FALLBACK_URL` | `https://co-cdn.yes.vg/team` | Fallback upstream when the primary returns a retriable network error; same URL format. |
+| `YESCODE_API_KEY` | _empty_ | Unified **primary** key for all three routes. Force-overrides client-supplied auth. |
+| `YESCODE_API_KEY_ANTHROPIC` / `_OPENAI` / `_GEMINI` | _empty_ | Per-route **fallback** keys. When the upstream rejects the primary key with a status in `YESCODE_KEY_FALLBACK_STATUSES`, the proxy retries the same request with the matching fallback key. Fallback keys reuse the same upstream URLs (same `/team` prefix). |
+| `YESCODE_KEY_FALLBACK_STATUSES` | `401,403` | Upstream statuses (comma-separated) that trigger the fallback-key retry. Defaults to auth-revoked / not-allowed; excludes 5xx (upstream-side faults a different key won't fix). |
+| `YESCODE_RETRY_STATUSES` | `429,503,529` | Upstream statuses (comma-separated) treated as **transient** and auto-retried. The proxy retries the same request on the primary's backoff schedule (200ms, 600ms), then the fallback host once, before surfacing the error. Mirrors the client-side auto-retry of the Anthropic/OpenAI SDKs so plain clients ride out a brief `no capacity available` (503) blip instead of hitting a hard failure. Unlike `YESCODE_KEY_FALLBACK_STATUSES` (which switches key), this just retries. |
+| `YESCODE_TIMEOUT_MS` | `30000` | Upstream socket inactivity timeout (ms). Default 30s — triggers retry on hung connections. SSE streams stay open as long as data keeps flowing. |
 | `YESCODE_CLAUDE_CLI_VERSION` | `2.1.75` | Used to build the spoofed `User-Agent`. |
 | `YESCODE_CLAUDE_CLI_ENTRYPOINT` | `cli` | Same. |
+| `YESCODE_CODEX_CLI_VERSION` | `0.137.0` | Version baked into the default codex `User-Agent`. |
+| `YESCODE_CODEX_USER_AGENT` | `codex_cli_rs/<version>` | `User-Agent` sent upstream on the OpenAI route. **Must start with `codex`** or the upstream 503s codex models. |
+| `YESCODE_CODEX_ORIGINATOR` | `codex_cli_rs` | `originator` header on the OpenAI route (fidelity only; not part of the upstream gate). |
+| `YESCODE_GEMINI_USER_AGENT` | `google-genai-sdk/1.16.0 gl-node/v22.0.0` | `User-Agent` sent upstream on the Gemini route. YesCode's gemini upstream 403s on competing-SDK UAs (e.g. `OpenAI/JS`); any non-OpenAI value passes. |
 | `YESCODE_ANTHROPIC_BETA` | `context-management-2025-06-27,interleaved-thinking-2025-05-14` | `anthropic-beta` header. |
 | `YESCODE_FULL_FINGERPRINT` | _off_ | `1` = also send Stainless SDK telemetry + remote-container/session headers. |
 | `YESCODE_STAINLESS_VERSION` | `0.74.0` | `X-Stainless-Package-Version`. |
