@@ -12,17 +12,17 @@ HTTP reverse proxy fronting **co.yes.vg** (YesCode) for OpenClaw. Handles three 
 | `gemini*` | Gemini | `/v1beta/models/{model}:generateContent` |
 | else (`gpt*`, `o*`, `*codex*`, unknown) | OpenAI | `/v1/responses` |
 
-Translation covers system messages, multi-turn text, streaming, and `tools` / `tool_calls` / `tool`-role round-trip in both directions. Credential selection and the upstream fingerprint (Claude-CLI `metadata.user_id`, codex `User-Agent`) follow the **resolved** backend, not the URL — a `claude*` model here gets the same fingerprint as the native `/v1/messages` route. **Vision/images are not supported cross-protocol**: the OpenAI path still accepts `image_url`, but the Claude/Gemini paths drop image parts. Anthropic requires `max_tokens`, so the Claude path defaults it to `4096` when the request sets neither `max_tokens` nor `max_completion_tokens`. The OpenAI path additionally maps `max_completion_tokens`, `response_format`, `reasoning_effort`. Non-2xx upstream errors pass through untouched.
+Translation covers system messages, multi-turn text, streaming, and `tools`, `tool_calls`, `tool`-role round-trip in both directions. Credential selection and the upstream fingerprint (Claude-CLI `metadata.user_id`, codex `User-Agent`) follow the **resolved** backend, not the URL — a `claude*` model here gets the same fingerprint as the native `/v1/messages` route. **Vision/images are not supported cross-protocol**: the OpenAI path still accepts `image_url`, but the Claude/Gemini paths drop image parts. Anthropic requires `max_tokens`, so the Claude path defaults it to `4096` when the request sets neither `max_tokens` nor `max_completion_tokens`. The OpenAI path additionally maps `max_completion_tokens`, `response_format`, `reasoning_effort`. Non-2xx upstream errors pass through untouched.
 
 The three native routes — `/v1/messages`, `/v1/responses`, `/v1beta/*` — stay plain passthrough (auth swap + fingerprint only, no body translation); call them directly to bypass translation entirely.
 
-YesCode gates the codex models (`gpt-5.x` / `*-codex` on `/v1/responses`) behind a `User-Agent` prefix check: only a UA that looks like a codex client is routed to the real Codex app-server, otherwise the request falls through to an unconfigured path that returns `503 "Codex app-server responses fallback is not configured"`. So the proxy spoofs a codex `User-Agent` on the OpenAI route (see `YESCODE_CODEX_*`) to make `gpt-5.x` work — the same idea as the Claude-CLI fingerprint on the Anthropic route. `originator` is sent for fidelity but isn't part of the gate.
+YesCode gates the codex models (`gpt-5.x`, `*-codex` on `/v1/responses`) behind a `User-Agent` prefix check: only a UA that looks like a codex client is routed to the real Codex app-server, otherwise the request falls through to an unconfigured path that returns `503 "Codex app-server responses fallback is not configured"`. So the proxy spoofs a codex `User-Agent` on the OpenAI route (see `YESCODE_CODEX_*`) to make `gpt-5.x` work — the same idea as the Claude-CLI fingerprint on the Anthropic route. `originator` is sent for fidelity but isn't part of the gate.
 
 Listens on `127.0.0.1:18790` by default. Single-file ESM script, no runtime deps.
 
 ## Install
 
-One-shot installer for macOS (launchd) and systemd-based Linux (Ubuntu/Debian/Fedora/Arch/openSUSE/RHEL …):
+One-shot installer for macOS (launchd) and systemd-based Linux (Ubuntu, Debian, Fedora, Arch, openSUSE, RHEL, etc.):
 
 ```bash
 git clone <this-repo> ~/yescode-proxy && cd ~/yescode-proxy
@@ -78,7 +78,7 @@ Installed as a **user-level** systemd service. User-linger is enabled, so it sur
 |---|---|
 | `~/workspace/yescode-proxy/server.js` | source |
 | `~/workspace/yescode-proxy/.env` | runtime config (see [Configuration](#configuration)) |
-| `~/projects/agents-a3ed4db99d/yescode-proxy.service` | upstream copy of the unit |
+| `~/workspace/yescode-proxy/yescode-proxy.service` | upstream copy of the unit |
 | `~/.config/systemd/user/yescode-proxy.service` | installed unit (`cp` from above, then `daemon-reload`) |
 | `~/.local/state/yescode-proxy.log` | log output (file append + journal) |
 
@@ -127,7 +127,7 @@ Rotated files are named `yescode-proxy.log-<YYYYMMDD>-<unix>.gz` (newest one sta
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill in. All keys are hot-reloadable except `PORT` / `BIND`.
+Copy `.env.example` to `.env` and fill in. All keys are hot-reloadable except `PORT` and `BIND`.
 
 | Key | Default | Purpose |
 |---|---|---|
@@ -136,7 +136,7 @@ Copy `.env.example` to `.env` and fill in. All keys are hot-reloadable except `P
 | `YESCODE_PRIMARY_URL` | `https://co.yes.vg/team` | Primary upstream as a full URL (scheme + host + optional path prefix). The scheme picks http/https, `host[:port]` addresses the socket, and the path becomes a prefix prepended to every route. Keep `/team` for team accounts, drop it for personal (e.g. `https://co.yes.vg`). |
 | `YESCODE_FALLBACK_URL` | `https://co-cdn.yes.vg/team` | Fallback upstream when the primary returns a retriable network error; same URL format. |
 | `YESCODE_API_KEY` | _empty_ | Unified **primary** key for all three routes. Force-overrides client-supplied auth. |
-| `YESCODE_API_KEY_ANTHROPIC` / `_OPENAI` / `_GEMINI` | _empty_ | Per-route **fallback** keys. When the upstream rejects the primary key with a status in `YESCODE_KEY_FALLBACK_STATUSES`, the proxy retries the same request with the matching fallback key. Fallback keys reuse the same upstream URLs (same `/team` prefix). |
+| `YESCODE_API_KEY_ANTHROPIC`, `_OPENAI`, `_GEMINI` | _empty_ | Per-route **fallback** keys. When the upstream rejects the primary key with a status in `YESCODE_KEY_FALLBACK_STATUSES`, the proxy retries the same request with the matching fallback key. Fallback keys reuse the same upstream URLs (same `/team` prefix). |
 | `YESCODE_KEY_FALLBACK_STATUSES` | `401,403` | Upstream statuses (comma-separated) that trigger the fallback-key retry. Defaults to auth-revoked / not-allowed; excludes 5xx (upstream-side faults a different key won't fix). |
 | `YESCODE_RETRY_STATUSES` | `429,503,529` | Upstream statuses (comma-separated) treated as **transient** and auto-retried. The proxy retries the same request on the primary's backoff schedule (200ms, 600ms), then the fallback host once, before surfacing the error. Mirrors the client-side auto-retry of the Anthropic/OpenAI SDKs so plain clients ride out a brief `no capacity available` (503) blip instead of hitting a hard failure. Unlike `YESCODE_KEY_FALLBACK_STATUSES` (which switches key), this just retries. |
 | `YESCODE_TIMEOUT_MS` | `30000` | Upstream socket inactivity timeout (ms). Default 30s — triggers retry on hung connections. SSE streams stay open as long as data keeps flowing. |
@@ -150,8 +150,8 @@ Copy `.env.example` to `.env` and fill in. All keys are hot-reloadable except `P
 | `YESCODE_FULL_FINGERPRINT` | _off_ | `1` = also send Stainless SDK telemetry + remote-container/session headers. |
 | `YESCODE_STAINLESS_VERSION` | `0.74.0` | `X-Stainless-Package-Version`. |
 | `YESCODE_DEVICE_SEED` | `yescode-proxy-default` | Hashed into the `metadata.user_id` device hash (stable across reloads). |
-| `YESCODE_REMOTE_CONTAINER_ID` / `_SESSION_ID` | _random per boot_ | Stable across reloads when unset; set explicitly to override. |
-| `YESCODE_ENV_FILE` | `./. env` | Path to watch for reload. Useful if the working dir isn't where `.env` lives. |
+| `YESCODE_REMOTE_CONTAINER_ID`, `_SESSION_ID` | _random per boot_ | Stable across reloads when unset; set explicitly to override. |
+| `YESCODE_ENV_FILE` | `./.env` | Path to watch for reload. Useful if the working dir isn't where `.env` lives. |
 
 ## Common operations
 
@@ -189,4 +189,4 @@ curl -s http://127.0.0.1:18790/health
 | `.env` | nothing — auto-reload (or `systemctl --user reload yescode-proxy`) |
 | `server.js` | `systemctl --user restart yescode-proxy` |
 | `yescode-proxy.service` | `cp` into `~/.config/systemd/user/`, then `systemctl --user daemon-reload && systemctl --user restart yescode-proxy` |
-| logrotate config / timer / service | edit under `~/.config/...`, then `systemctl --user daemon-reload && systemctl --user restart yescode-proxy-logrotate.timer` |
+| logrotate config, timer, service | edit under `~/.config/...`, then `systemctl --user daemon-reload && systemctl --user restart yescode-proxy-logrotate.timer` |
