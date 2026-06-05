@@ -136,7 +136,9 @@ Copy `.env.example` to `.env` and fill in. All keys are hot-reloadable except `P
 | `YESCODE_PRIMARY_URL` | `https://co.yes.vg/team` | Primary upstream as a full URL (scheme + host + optional path prefix). The scheme picks http/https, `host[:port]` addresses the socket, and the path becomes a prefix prepended to every route. Keep `/team` for team accounts, drop it for personal (e.g. `https://co.yes.vg`). |
 | `YESCODE_FALLBACK_URL` | `https://co-cdn.yes.vg/team` | Fallback upstream when the primary returns a retriable network error; same URL format. |
 | `YESCODE_API_KEY` | _empty_ | Unified **primary** key for all three routes. Force-overrides client-supplied auth. |
-| `YESCODE_API_KEY_ANTHROPIC`, `YESCODE_API_KEY_OPENAI`, `YESCODE_API_KEY_GEMINI` | _empty_ | Per-route **fallback** keys. When the upstream rejects the primary key with a status in `YESCODE_KEY_FALLBACK_STATUSES`, the proxy retries the same request with the matching fallback key. Fallback keys reuse the same upstream URLs (same `/team` prefix). |
+| `YESCODE_API_KEY_ANTHROPIC` | _empty_ | **Fallback** key for the Anthropic route, used when the primary key is rejected with a `YESCODE_KEY_FALLBACK_STATUSES` status. Reuses the same upstream URL (same `/team` prefix). |
+| `YESCODE_API_KEY_OPENAI` | _empty_ | **Fallback** key for the OpenAI route, used when the primary key is rejected with a `YESCODE_KEY_FALLBACK_STATUSES` status. Reuses the same upstream URL (same `/team` prefix). |
+| `YESCODE_API_KEY_GEMINI` | _empty_ | **Fallback** key for the Gemini route, used when the primary key is rejected with a `YESCODE_KEY_FALLBACK_STATUSES` status. Reuses the same upstream URL (same `/team` prefix). |
 | `YESCODE_KEY_FALLBACK_STATUSES` | `401,403` | Upstream statuses (comma-separated) that trigger the fallback-key retry. Defaults to auth-revoked / not-allowed; excludes 5xx (upstream-side faults a different key won't fix). |
 | `YESCODE_RETRY_STATUSES` | `429,503,529` | Upstream statuses (comma-separated) treated as **transient** and auto-retried. The proxy retries the same request on the primary's backoff schedule (200ms, 600ms), then the fallback host once, before surfacing the error. Mirrors the client-side auto-retry of the Anthropic/OpenAI SDKs so plain clients ride out a brief `no capacity available` (503) blip instead of hitting a hard failure. Unlike `YESCODE_KEY_FALLBACK_STATUSES` (which switches key), this just retries. |
 | `YESCODE_TIMEOUT_MS` | `30000` | Upstream socket inactivity timeout (ms). Default 30s — triggers retry on hung connections. SSE streams stay open as long as data keeps flowing. |
@@ -150,7 +152,8 @@ Copy `.env.example` to `.env` and fill in. All keys are hot-reloadable except `P
 | `YESCODE_FULL_FINGERPRINT` | _off_ | `1` = also send Stainless SDK telemetry + remote-container/session headers. |
 | `YESCODE_STAINLESS_VERSION` | `0.74.0` | `X-Stainless-Package-Version`. |
 | `YESCODE_DEVICE_SEED` | `yescode-proxy-default` | Hashed into the `metadata.user_id` device hash (stable across reloads). |
-| `YESCODE_REMOTE_CONTAINER_ID`, `YESCODE_REMOTE_SESSION_ID` | _random per boot_ | Stable across reloads when unset; set explicitly to override. |
+| `YESCODE_REMOTE_CONTAINER_ID` | _random per boot_ | Stable across reloads when unset; set explicitly to override. |
+| `YESCODE_REMOTE_SESSION_ID` | _random per boot_ | Stable across reloads when unset; set explicitly to override. |
 | `YESCODE_ENV_FILE` | `./.env` | Path to watch for reload. Useful if the working dir isn't where `.env` lives. |
 
 ## Common operations

@@ -136,7 +136,9 @@ YESCODE_API_KEY=team-xxxxxxxx ./install.sh
 | `YESCODE_PRIMARY_URL` | `https://co.yes.vg/team` | 主上游完整 URL（协议 + 主机 + 可选路径前缀）。协议决定 http/https，`host[:port]` 定位套接字，路径作为前缀拼到每个路由前。team 账号带 `/team`，个人账号去掉（如 `https://co.yes.vg`）。 |
 | `YESCODE_FALLBACK_URL` | `https://co-cdn.yes.vg/team` | 主上游返回可重试网络错误时的回落上游，URL 格式同上。 |
 | `YESCODE_API_KEY` | _空_ | 三个路由共用的**主** key，强制覆盖客户端自带鉴权。 |
-| `YESCODE_API_KEY_ANTHROPIC`、`YESCODE_API_KEY_OPENAI`、`YESCODE_API_KEY_GEMINI` | _空_ | 各路由的**回退** key。上游对主 key 返回 `YESCODE_KEY_FALLBACK_STATUSES` 里的状态码时，自动改用对应回退 key 重发同一请求。回退 key 沿用相同的上游 URL（同 `/team` 前缀）。 |
+| `YESCODE_API_KEY_ANTHROPIC` | _空_ | Anthropic 路由的**回退** key，主 key 被 `YESCODE_KEY_FALLBACK_STATUSES` 状态码拒绝时启用，沿用相同的上游 URL（同 `/team` 前缀）。 |
+| `YESCODE_API_KEY_OPENAI` | _空_ | OpenAI 路由的**回退** key，主 key 被 `YESCODE_KEY_FALLBACK_STATUSES` 状态码拒绝时启用，沿用相同的上游 URL（同 `/team` 前缀）。 |
+| `YESCODE_API_KEY_GEMINI` | _空_ | Gemini 路由的**回退** key，主 key 被 `YESCODE_KEY_FALLBACK_STATUSES` 状态码拒绝时启用，沿用相同的上游 URL（同 `/team` 前缀）。 |
 | `YESCODE_KEY_FALLBACK_STATUSES` | `401,403` | 触发回退 key 重试的上游状态码（逗号分隔）。默认认证失败/无权限；不含 5xx（上游服务端故障，换 key 也救不了）。 |
 | `YESCODE_RETRY_STATUSES` | `429,503,529` | 视为**瞬时**、自动重试的上游状态码（逗号分隔）。代理对同一请求按退避（200ms、600ms）在主机重试、再到回落上游试一次，仍失败才把错误透传。模拟 Anthropic/OpenAI SDK 客户端侧的自动重试，让普通客户端能扛过短暂的 `no capacity available`（503）抖动，而不是直接吃到硬失败。与 `YESCODE_KEY_FALLBACK_STATUSES` 不同：那个换 key，这个只重试。 |
 | `YESCODE_TIMEOUT_MS` | `30000` | 上游 socket 无活动超时（毫秒）。默认 30 秒 —— 连接挂起时触发重试。SSE 流只要持续有数据就不会超时。 |
@@ -150,7 +152,8 @@ YESCODE_API_KEY=team-xxxxxxxx ./install.sh
 | `YESCODE_FULL_FINGERPRINT` | _关_ | `1` = 同时发送 Stainless SDK 遥测 + remote-container/session 请求头。 |
 | `YESCODE_STAINLESS_VERSION` | `0.74.0` | `X-Stainless-Package-Version`。 |
 | `YESCODE_DEVICE_SEED` | `yescode-proxy-default` | 哈希后写入 `metadata.user_id` 的设备 hash（跨重载稳定）。 |
-| `YESCODE_REMOTE_CONTAINER_ID`、`YESCODE_REMOTE_SESSION_ID` | _每次启动随机_ | 未设置时跨重载保持启动时的值；显式设置可覆盖。 |
+| `YESCODE_REMOTE_CONTAINER_ID` | _每次启动随机_ | 未设置时跨重载保持启动时的值；显式设置可覆盖。 |
+| `YESCODE_REMOTE_SESSION_ID` | _每次启动随机_ | 未设置时跨重载保持启动时的值；显式设置可覆盖。 |
 | `YESCODE_ENV_FILE` | `./.env` | 被监视的路径。若工作目录不是 `.env` 所在位置时有用。 |
 
 ## 常用操作
