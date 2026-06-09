@@ -129,32 +129,15 @@ YESCODE_API_KEY=team-xxxxxxxx ./install.sh
 
 把 `.env.example` 复制为 `.env` 后填写。除了 `PORT`、`BIND`，所有 key 都支持热重载。
 
+快速上手必填项：
+
 | Key | 默认值 | 用途 |
 |---|---|---|
 | `PORT` | `18790` | 监听端口（仅重启生效）。 |
 | `BIND` | `127.0.0.1` | 监听地址（仅重启生效）。 |
-| `YESCODE_PRIMARY_URL` | `https://co.yes.vg/team` | 主上游完整 URL（协议 + 主机 + 可选路径前缀）。协议决定 http/https，`host[:port]` 定位套接字，路径作为前缀拼到每个路由前。team 账号带 `/team`，个人账号去掉（如 `https://co.yes.vg`）。 |
-| `YESCODE_FALLBACK_URL` | `https://co-cdn.yes.vg/team` | 主上游返回可重试网络错误时的回落上游，URL 格式同上。 |
-| `YESCODE_API_KEY` | _空_ | 三个路由共用的**主** key，强制覆盖客户端自带鉴权。 |
-| `YESCODE_API_KEY_ANTHROPIC` | _空_ | Anthropic 路由的**回退** key，主 key 被 `YESCODE_KEY_FALLBACK_STATUSES` 状态码拒绝时启用，沿用相同的上游 URL（同 `/team` 前缀）。 |
-| `YESCODE_API_KEY_OPENAI` | _空_ | OpenAI 路由的**回退** key，主 key 被 `YESCODE_KEY_FALLBACK_STATUSES` 状态码拒绝时启用，沿用相同的上游 URL（同 `/team` 前缀）。 |
-| `YESCODE_API_KEY_GEMINI` | _空_ | Gemini 路由的**回退** key，主 key 被 `YESCODE_KEY_FALLBACK_STATUSES` 状态码拒绝时启用，沿用相同的上游 URL（同 `/team` 前缀）。 |
-| `YESCODE_KEY_FALLBACK_STATUSES` | `401,403` | 触发回退 key 重试的上游状态码（逗号分隔）。默认认证失败/无权限；不含 5xx（上游服务端故障，换 key 也救不了）。 |
-| `YESCODE_RETRY_STATUSES` | `429,503,529` | 视为**瞬时**、自动重试的上游状态码（逗号分隔）。代理对同一请求按退避（200ms、600ms）在主机重试、再到回落上游试一次，仍失败才把错误透传。模拟 Anthropic/OpenAI SDK 客户端侧的自动重试，让普通客户端能扛过短暂的 `no capacity available`（503）抖动，而不是直接吃到硬失败。与 `YESCODE_KEY_FALLBACK_STATUSES` 不同：那个换 key，这个只重试。 |
-| `YESCODE_TIMEOUT_MS` | `30000` | 上游 socket 无活动超时（毫秒）。默认 30 秒 —— 连接挂起时触发重试。SSE 流只要持续有数据就不会超时。 |
-| `YESCODE_CLAUDE_CLI_VERSION` | `2.1.75` | 用于伪造 `User-Agent`。 |
-| `YESCODE_CLAUDE_CLI_ENTRYPOINT` | `cli` | 同上。 |
-| `YESCODE_CODEX_CLI_VERSION` | `0.137.0` | 拼进 codex `User-Agent` 默认值的版本号。 |
-| `YESCODE_CODEX_USER_AGENT` | `codex_cli_rs/<版本>` | OpenAI 路由发往上游的 `User-Agent`。**必须以 `codex` 开头**，否则上游对 codex 模型返回 503。 |
-| `YESCODE_CODEX_ORIGINATOR` | `codex_cli_rs` | OpenAI 路由的 `originator` 请求头（仅为还原真实请求，不参与上游校验）。 |
-| `YESCODE_GEMINI_USER_AGENT` | `google-genai-sdk/1.16.0 gl-node/v22.0.0` | Gemini 路由发往上游的 `User-Agent`。YesCode 的 gemini 上游会对竞品 SDK 的 UA（如 `OpenAI/JS`）返回 403；任何非 OpenAI 值均可通过。 |
-| `YESCODE_ANTHROPIC_BETA` | `context-management-2025-06-27,interleaved-thinking-2025-05-14` | `anthropic-beta` 请求头。 |
-| `YESCODE_FULL_FINGERPRINT` | _关_ | `1` = 同时发送 Stainless SDK 遥测 + remote-container/session 请求头。 |
-| `YESCODE_STAINLESS_VERSION` | `0.74.0` | `X-Stainless-Package-Version`。 |
-| `YESCODE_DEVICE_SEED` | `yescode-proxy-default` | 哈希后写入 `metadata.user_id` 的设备 hash（跨重载稳定）。 |
-| `YESCODE_REMOTE_CONTAINER_ID` | _每次启动随机_ | 未设置时跨重载保持启动时的值；显式设置可覆盖。 |
-| `YESCODE_REMOTE_SESSION_ID` | _每次启动随机_ | 未设置时跨重载保持启动时的值；显式设置可覆盖。 |
-| `YESCODE_ENV_FILE` | `./.env` | 被监视的路径。若工作目录不是 `.env` 所在位置时有用。 |
+| `YESCODE_API_KEY` | _空_ | 三个路由共用的主 key，强制覆盖客户端鉴权。 |
+
+其余配置（上游 URL、回退 key、重试策略、指纹伪造、调试开关等约 20 项）见完整参考：[`llmdoc/reference/config.md`](llmdoc/reference/config.md)。
 
 ## 请求示例
 
