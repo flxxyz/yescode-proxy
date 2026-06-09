@@ -135,11 +135,9 @@ YESCODE_API_KEY=team-xxxxxxxx ./install.sh
 |---|---|---|
 | `PORT` | `18790` | 监听端口（仅重启生效）。 |
 | `BIND` | `127.0.0.1` | 监听地址（仅重启生效）。 |
-| `YESCODE_PRIMARY_URL` | `https://co.yes.vg/team` | 主上游 URL。team 账号带 `/team`，个人账号去掉。 |
-| `YESCODE_FALLBACK_URL` | `https://co-cdn.yes.vg/team` | 回落上游。 |
 | `YESCODE_API_KEY` | _空_ | 三个路由共用的主 key，强制覆盖客户端鉴权。 |
 
-其余配置（回退 key、重试策略、指纹伪造、调试开关等约 20 项）见完整参考：[`llmdoc/reference/config.md`](llmdoc/reference/config.md)。
+其余配置（上游 URL、回退 key、重试策略、指纹伪造、调试开关等约 20 项）见完整参考：[`llmdoc/reference/config.md`](llmdoc/reference/config.md)。
 
 ## 请求示例
 

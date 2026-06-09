@@ -135,11 +135,9 @@ Quickstart essentials:
 |---|---|---|
 | `PORT` | `18790` | Listen port (restart only). |
 | `BIND` | `127.0.0.1` | Listen address (restart only). |
-| `YESCODE_PRIMARY_URL` | `https://co.yes.vg/team` | Primary upstream URL. Keep `/team` for team accounts, drop it for personal. |
-| `YESCODE_FALLBACK_URL` | `https://co-cdn.yes.vg/team` | Fallback upstream. |
 | `YESCODE_API_KEY` | _empty_ | Unified primary key for all three routes. Force-overrides client-supplied auth. |
 
-For the remaining ~20 options (fallback keys, retry policy, fingerprint spoofing, debug switches, etc.) see the full reference: [`llmdoc/reference/config.md`](llmdoc/reference/config.md).
+For the remaining ~20 options (upstream URLs, fallback keys, retry policy, fingerprint spoofing, debug switches, etc.) see the full reference: [`llmdoc/reference/config.md`](llmdoc/reference/config.md).
 
 ## Request examples
 
