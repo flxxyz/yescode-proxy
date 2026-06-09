@@ -12,6 +12,12 @@ const BOOT_PORT = Number.parseInt(process.env.PORT ?? '18790', 10);
 const BOOT_BIND = process.env.BIND ?? '127.0.0.1';
 const ENV_FILE_PATH = process.env.YESCODE_ENV_FILE
   ?? resolvePath(process.cwd(), '.env');
+// Client-facing virtual-SK allowlist (edge auth). Same override + default-in-cwd
+// convention as the env file, hot-reloaded the same way. An absent file means
+// "no allowlist" → fail-open (every request passes), so the proxy stays
+// backward-compatible until you opt in by creating keys.json.
+const KEYS_FILE_PATH = process.env.YESCODE_KEYS_FILE
+  ?? resolvePath(process.cwd(), 'keys.json');
 
 // Stable across reloads — re-rolling these on every reload would shuffle
 // the device fingerprint we send to yescode, which is the opposite of
@@ -56,6 +62,23 @@ function maskAuthValue(value) {
   const s = String(value ?? '');
   if (s.length <= 12) return s.replace(/./g, '*');
   return `${s.slice(0, 8)}…${s.slice(-6)}`;
+}
+
+// Virtual-SK label for metrics. Keeps the `sk-yc-` prefix, then first-4 + four
+// fixed 'x' + last-4 of the body (a too-short body collapses to just the mask).
+// e.g. sk-yc-alice-9f3k2m → sk-yc-alicxxxx3k2m. Only ever applied to keys drawn
+// from the allowlist — never to a client-supplied value — so the set of distinct
+// labels in /metrics is bounded by the allowlist size, not by traffic.
+const VKEY_PREFIX = 'sk-yc-';
+const VKEY_MASK = 'xxxx';
+function maskMetricKey(sk) {
+  const s = String(sk ?? '');
+  if (!s) return '(none)';
+  const hasPrefix = s.startsWith(VKEY_PREFIX);
+  const prefix = hasPrefix ? VKEY_PREFIX : '';
+  const body = hasPrefix ? s.slice(VKEY_PREFIX.length) : s;
+  if (body.length <= 8) return prefix + VKEY_MASK;   // too short: first-4/last-4 would overlap
+  return prefix + body.slice(0, 4) + VKEY_MASK + body.slice(-4);
 }
 
 function shortId() {
@@ -270,6 +293,194 @@ function applyReload(reason) {
   config = next;
 }
 
+// --- virtual SK edge auth ---
+// An allowlist of client-facing "virtual" SKs, loaded from KEYS_FILE_PATH and
+// hot-reloaded like .env. This is the ONLY edge gate: downstream the proxy still
+// force-overrides the client key with the real upstream credential (see
+// buildUpstreamHeaders), so a virtual SK never reaches the upstream — it only
+// decides whether a request is let in. Fail-open: an empty / missing / invalid
+// file means "no allowlist" and every request passes (backward-compatible with
+// the pre-auth proxy). State is an atomically-swapped Map so in-flight requests
+// always read a consistent allowlist.
+let virtualKeys = new Map();   // sk plaintext -> { label, enabled, expires|null }
+
+function parseKeysFile(text) {
+  const data = JSON.parse(text);
+  // Accept either { "keys": [...] } or a bare top-level array.
+  const list = Array.isArray(data) ? data : data?.keys;
+  if (!Array.isArray(list)) throw new Error('expected { "keys": [...] } or a top-level array');
+  const next = new Map();
+  for (const entry of list) {
+    if (!entry || typeof entry !== 'object') continue;
+    const key = typeof entry.key === 'string' ? entry.key.trim() : '';
+    if (!key) continue;
+    next.set(key, Object.freeze({
+      label: typeof entry.label === 'string' && entry.label ? entry.label : maskMetricKey(key),
+      enabled: entry.enabled !== false,   // default true; only an explicit false disables
+      expires: typeof entry.expires === 'string' ? entry.expires : null,
+    }));
+  }
+  return next;
+}
+
+// Read the allowlist from disk. A missing file is "no allowlist" (empty Map);
+// anything else (bad JSON, bad shape, unreadable) throws so the caller can decide
+// whether to keep the previous allowlist (reload) or fail-open (boot).
+function loadKeysFile(path) {
+  let text;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return new Map();
+    throw err;
+  }
+  if (!text.trim()) return new Map();
+  return parseKeysFile(text);
+}
+
+virtualKeys = (() => {
+  try {
+    return loadKeysFile(KEYS_FILE_PATH);
+  } catch (err) {
+    console.warn(`${timestamp()} WARN initial keys file load failed: ${err.message} — auth disabled (fail-open)`);
+    return new Map();
+  }
+})();
+
+let keysReloadTimer = null;
+function scheduleKeysReload(reason) {
+  if (keysReloadTimer) clearTimeout(keysReloadTimer);
+  keysReloadTimer = setTimeout(() => {
+    keysReloadTimer = null;
+    applyKeysReload(reason);
+  }, 200);
+}
+
+function applyKeysReload(reason) {
+  let next;
+  try {
+    next = loadKeysFile(KEYS_FILE_PATH);
+  } catch (err) {
+    // Fail-safe: a malformed edit keeps the current allowlist rather than
+    // dropping every key — which, under fail-open, would silently turn auth off.
+    console.error(`${timestamp()} keys reload aborted (${reason}): ${err.message} — keeping ${virtualKeys.size} key(s)`);
+    return;
+  }
+  const before = virtualKeys.size;
+  virtualKeys = next;   // atomic reference swap
+  const mode = next.size === 0 ? 'disabled (fail-open)' : `${next.size} key(s)`;
+  console.log(`${timestamp()} keys reload (${reason}): ${before} → ${mode}`);
+}
+
+// Pull the presented client key out of the request. Mirrors what the upstream
+// header builder strips: Authorization: Bearer <key> (or a raw Authorization
+// value) first, then x-api-key. Node lowercases header names.
+function presentedClientKey(headers) {
+  const auth = headers['authorization'];
+  if (typeof auth === 'string' && auth.trim()) {
+    const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
+    return (m ? m[1] : auth).trim();
+  }
+  const xk = headers['x-api-key'];
+  if (typeof xk === 'string' && xk.trim()) return xk.trim();
+  return '';
+}
+
+// Authorize a presented key against the allowlist. Fail-open: an empty allowlist
+// authorizes everything (vkey null → metrics attribute to '(none)'). On success
+// vkey is the masked allowlist label (bounded). On rejection vkey is always null
+// — a rejected key is attacker-controlled and must never become a metric label.
+// reason ∈ missing | unknown | disabled | expired.
+function authorizeVirtualKey(presented) {
+  if (virtualKeys.size === 0) return { ok: true, vkey: null, reason: null };
+  const key = typeof presented === 'string' ? presented.trim() : '';
+  if (!key) return { ok: false, vkey: null, reason: 'missing' };
+  const rec = virtualKeys.get(key);
+  if (!rec) return { ok: false, vkey: null, reason: 'unknown' };
+  if (!rec.enabled) return { ok: false, vkey: null, reason: 'disabled' };
+  if (rec.expires) {
+    const t = Date.parse(rec.expires);
+    if (Number.isFinite(t) && t <= Date.now()) return { ok: false, vkey: null, reason: 'expired' };
+  }
+  return { ok: true, vkey: maskMetricKey(key), reason: null };
+}
+
+// --- per-key usage metrics (Prometheus text exposition, zero-dep) ---
+// Every series is keyed by a bounded label tuple. The vkey label is always a
+// masked allowlist key (or '(none)' when auth is disabled) — never a client-
+// supplied value — so cardinality is bounded by the allowlist. rejects_total is
+// deliberately label-light (reason only, NO vkey): a rejected key is attacker-
+// controlled. requests_total and rejects_total are disjoint — a request lands in
+// exactly one of them, so total traffic = sum of both.
+const SEP = '\x1f';
+const metrics = {
+  requests: new Map(),    // vkey│route│status_class -> count
+  tokens: new Map(),      // vkey│route│direction -> count
+  bytes: new Map(),       // vkey│route -> count
+  rejects: new Map(),     // reason -> count
+  fallbacks: new Map(),   // vkey│route -> count
+  retries: new Map(),     // vkey│route -> count
+  lastUsed: new Map(),    // vkey -> unix seconds
+};
+function inc(map, key, by = 1) {
+  map.set(key, (map.get(key) ?? 0) + by);
+}
+function statusClass(code) {
+  const n = Number(code);
+  if (!Number.isFinite(n) || n < 100 || n > 599) return '0xx';
+  return `${Math.floor(n / 100)}xx`;
+}
+
+// Terminal-outcome hook, fired once per metered request from res.on('close').
+// ctx.skip short-circuits outcomes counted elsewhere (auth rejects → rejects_total)
+// or not metered at all; health/root/metrics never register the hook in the first
+// place. Status comes from the live res at close, so every exit (success, 4xx,
+// 502) is attributed without threading status through each return.
+function recordOutcome(ctx, res) {
+  if (ctx.skip) return;
+  const vkey = ctx.vkey ?? '(none)';
+  const route = ctx.route ?? 'unknown';
+  inc(metrics.requests, `${vkey}${SEP}${route}${SEP}${statusClass(res.statusCode)}`);
+  const u = ctx.usage;
+  if (u) {
+    if (u.in != null) inc(metrics.tokens, `${vkey}${SEP}${route}${SEP}input`, u.in);
+    if (u.out != null) inc(metrics.tokens, `${vkey}${SEP}${route}${SEP}output`, u.out);
+    if (u.cache_read != null) inc(metrics.tokens, `${vkey}${SEP}${route}${SEP}cache_read`, u.cache_read);
+    if (u.cache_write != null) inc(metrics.tokens, `${vkey}${SEP}${route}${SEP}cache_write`, u.cache_write);
+  }
+  if (ctx.bytes) inc(metrics.bytes, `${vkey}${SEP}${route}`, ctx.bytes);
+  metrics.lastUsed.set(vkey, Math.floor(Date.now() / 1000));
+}
+
+// Prometheus label-value escaping: backslash, newline, double-quote.
+function escLabel(v) {
+  return String(v).replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/"/g, '\\"');
+}
+function renderMetrics() {
+  const out = [];
+  const emit = (name, help, type, map, labelNames) => {
+    out.push(`# HELP ${name} ${help}`);
+    out.push(`# TYPE ${name} ${type}`);
+    for (const [k, v] of map) {
+      const vals = k.split(SEP);
+      const labels = labelNames.map((ln, i) => `${ln}="${escLabel(vals[i] ?? '')}"`).join(',');
+      out.push(`${name}{${labels}} ${v}`);
+    }
+  };
+  emit('yescode_requests_total', 'Proxied requests by virtual key, route and status class.', 'counter', metrics.requests, ['vkey', 'route', 'status_class']);
+  emit('yescode_tokens_total', 'Tokens by virtual key, route and direction (input/output/cache_read/cache_write).', 'counter', metrics.tokens, ['vkey', 'route', 'direction']);
+  emit('yescode_bytes_total', 'Downstream response bytes by virtual key and route.', 'counter', metrics.bytes, ['vkey', 'route']);
+  emit('yescode_rejects_total', 'Rejected requests by reason (no key label: rejected keys are unbounded).', 'counter', metrics.rejects, ['reason']);
+  emit('yescode_fallbacks_total', 'Key-failure fallbacks (switched to the next credential) by virtual key and route.', 'counter', metrics.fallbacks, ['vkey', 'route']);
+  emit('yescode_retries_total', 'Transient-status retries (same credential) by virtual key and route.', 'counter', metrics.retries, ['vkey', 'route']);
+  out.push('# HELP yescode_key_last_used_timestamp_seconds Last time a virtual key served a request (unix seconds).');
+  out.push('# TYPE yescode_key_last_used_timestamp_seconds gauge');
+  for (const [vkey, ts] of metrics.lastUsed) {
+    out.push(`yescode_key_last_used_timestamp_seconds{vkey="${escLabel(vkey)}"} ${ts}`);
+  }
+  return `${out.join('\n')}\n`;
+}
+
 function fallbackKeyForRoute(route) {
   if (route === 'anthropic') return { key: config.apiKeyAnthropic, label: 'anthropic' };
   if (route === 'openai' || route === 'openai-chat') return { key: config.apiKeyOpenai, label: 'openai' };
@@ -386,9 +597,19 @@ function formatUsageParts({ in: inp, out, cache_read: cr, cache_write: cw }) {
   return parts.length ? parts.join(' ') : null;
 }
 
+// Normalize a provider usage object to numeric token counts, or null when no
+// field is present. Distinct from formatUsageParts (which renders the same shape
+// to a log string): metrics need the raw numbers and the log line needs the
+// string, so extraction returns numbers and formatting happens lazily at the two
+// sinks (the response log line and recordOutcome).
+function usageNums({ in: inp, out, cache_read: cr, cache_write: cw }) {
+  if (inp == null && out == null && cr == null && cw == null) return null;
+  return { in: inp ?? null, out: out ?? null, cache_read: cr ?? null, cache_write: cw ?? null };
+}
+
 function usageFromAnthropic(u) {
   if (!u || typeof u !== 'object') return null;
-  return formatUsageParts({
+  return usageNums({
     in: u.input_tokens,
     out: u.output_tokens,
     cache_read: u.cache_read_input_tokens,
@@ -398,7 +619,7 @@ function usageFromAnthropic(u) {
 
 function usageFromOpenAI(u) {
   if (!u || typeof u !== 'object') return null;
-  return formatUsageParts({
+  return usageNums({
     in: u.prompt_tokens ?? u.input_tokens,
     out: u.completion_tokens ?? u.output_tokens,
   });
@@ -406,7 +627,7 @@ function usageFromOpenAI(u) {
 
 function usageFromGemini(u) {
   if (!u || typeof u !== 'object') return null;
-  return formatUsageParts({
+  return usageNums({
     in: u.promptTokenCount,
     out: u.candidatesTokenCount,
   });
@@ -1824,7 +2045,7 @@ function forwardOnce({ host, port = 443, protocol = 'https:', method, path, head
         }
         if (transform && transform.getCapturedUsage) {
           const u = transform.getCapturedUsage();
-          if (u) return formatUsageParts({ in: u.input_tokens, out: u.output_tokens });
+          if (u) return usageNums({ in: u.input_tokens, out: u.output_tokens });
         }
         return null;
       };
@@ -2001,6 +2222,45 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && req.url === '/metrics') {
+    res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' });
+    res.end(renderMetrics());
+    return;
+  }
+
+  // Past this point every request is a metered API call. Register the terminal-
+  // outcome hook now so any exit below — auth reject, 404, 400, success, 502 — is
+  // recorded exactly once when the response socket closes. reqCtx carries what the
+  // hook can't read off res (the resolved virtual key, route, usage, byte count).
+  const reqCtx = { vkey: null, route, bytes: 0, usage: null, skip: false };
+  let recorded = false;
+  res.on('close', () => {
+    // Defer past nextTick + the promise microtask queue. res 'close' can be
+    // emitted from res.end() (inside forwardOnce) via nextTick — i.e. BEFORE the
+    // `await forwardOnce` continuation below assigns reqCtx.usage/bytes — so
+    // recording inline would miss usage/bytes on every success. setImmediate runs
+    // in the check phase, after both, by which point reqCtx is fully populated.
+    setImmediate(() => {
+      if (recorded) return;
+      recorded = true;
+      recordOutcome(reqCtx, res);
+    });
+  });
+
+  // Edge auth: gate on the virtual-SK allowlist before any upstream work. Empty
+  // allowlist → fail-open. Additive only — the upstream credential is still
+  // injected downstream regardless of which virtual key got the request in.
+  const auth = authorizeVirtualKey(presentedClientKey(req.headers));
+  if (!auth.ok) {
+    inc(metrics.rejects, auth.reason);
+    reqCtx.skip = true;   // counted in rejects_total — keep it out of requests_total
+    log.warn(`reject ${req.method} ${req.url} — ${auth.reason} key`);
+    res.writeHead(401, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'invalid api key', type: 'authentication_error' } }));
+    return;
+  }
+  reqCtx.vkey = auth.vkey;
+
   if (route === 'unknown') {
     log.warn(`reject unknown path ${req.method} ${req.url}`);
     res.writeHead(404, { 'content-type': 'application/json' });
@@ -2160,13 +2420,18 @@ const server = createServer(async (req, res) => {
           if (hasNextCred && config.keyFallbackStatuses.includes(result.status)) {
             const next = credentials[ci + 1];
             log.info(`<- ${result.status} ${ms}ms via=${host}${fullPath} key=${cred.label} bytes=${result.bytes} rejected → fallback to ${next.label} key`);
+            inc(metrics.fallbacks, `${reqCtx.vkey ?? '(none)'}${SEP}${route}`);
             fellBack = true;
             break;
           }
           log.info(`<- ${result.status} ${ms}ms via=${host}${fullPath} key=${cred.label} bytes=${result.bytes} transient → retry (attempt ${attemptIdx}/${attempts.length})`);
+          inc(metrics.retries, `${reqCtx.vkey ?? '(none)'}${SEP}${route}`);
           continue;
         }
-        log.info(`<- ${result.status} ${ms}ms via=${host}${fullPath} key=${cred.label} bytes=${result.bytes}${result.usage ? ` ${result.usage}` : ''}${result.streamError ? ` streamError=${result.streamError.message}` : ''}`);
+        reqCtx.usage = result.usage;
+        reqCtx.bytes = result.bytes;
+        const usageStr = result.usage ? formatUsageParts(result.usage) : null;
+        log.info(`<- ${result.status} ${ms}ms via=${host}${fullPath} key=${cred.label} bytes=${result.bytes}${usageStr ? ` ${usageStr}` : ''}${result.streamError ? ` streamError=${result.streamError.message}` : ''}`);
         return;
       } catch (err) {
         lastErr = err;
@@ -2219,18 +2484,30 @@ server.listen(BOOT_PORT, BOOT_BIND, () => {
     console.log(`${timestamp()} key chain: primary=${config.apiKey ? 'team' : '(none)'} fallbacks=${fbDesc}`);
   }
   console.log(`${timestamp()} transient retry: ${config.retryStatuses.join('/')} (backoff ${PRIMARY_BACKOFFS_MS.join('/')}ms, then fallback host)`);
-  console.log(`${timestamp()} hot-reload: SIGHUP (systemctl reload) + watching ${ENV_FILE_PATH}`);
+  console.log(`${timestamp()} virtual-key auth: ${virtualKeys.size === 0 ? 'disabled (fail-open, no keys.json)' : `${virtualKeys.size} key(s) from ${KEYS_FILE_PATH}`}`);
+  console.log(`${timestamp()} metrics: GET /metrics (Prometheus text, unauthenticated — protect via bind ${BOOT_BIND})`);
+  console.log(`${timestamp()} hot-reload: SIGHUP (systemctl reload) + watching ${ENV_FILE_PATH} + ${KEYS_FILE_PATH}`);
 });
 
 process.on('SIGHUP', () => {
   console.log(`${timestamp()} SIGHUP received`);
   applyReload('SIGHUP');
+  applyKeysReload('SIGHUP');
 });
 
 watchFile(ENV_FILE_PATH, { interval: 1000 }, (curr, prev) => {
   if (curr.mtimeMs === prev.mtimeMs) return;
   console.log(`${timestamp()} ${ENV_FILE_PATH} changed (mtime ${prev.mtimeMs}→${curr.mtimeMs})`);
   scheduleReload('fs');
+});
+
+// Second watcher for the virtual-SK allowlist. mtime 0 → real (file created) and
+// real → 0 (file deleted) both fire here; loadKeysFile maps a missing file to an
+// empty allowlist, so deleting keys.json hot-disables auth (fail-open).
+watchFile(KEYS_FILE_PATH, { interval: 1000 }, (curr, prev) => {
+  if (curr.mtimeMs === prev.mtimeMs) return;
+  console.log(`${timestamp()} ${KEYS_FILE_PATH} changed (mtime ${prev.mtimeMs}→${curr.mtimeMs})`);
+  scheduleKeysReload('fs');
 });
 
 const shutdown = (signal) => {
