@@ -374,7 +374,9 @@ function applyKeysReload(reason) {
 
 // Pull the presented client key out of the request. Mirrors what the upstream
 // header builder strips: Authorization: Bearer <key> (or a raw Authorization
-// value) first, then x-api-key. Node lowercases header names.
+// value) first, then x-api-key, then x-goog-api-key — native Gemini clients on
+// the /v1beta/* route carry the key there, not in Authorization. Node lowercases
+// header names.
 function presentedClientKey(headers) {
   const auth = headers['authorization'];
   if (typeof auth === 'string' && auth.trim()) {
@@ -383,6 +385,8 @@ function presentedClientKey(headers) {
   }
   const xk = headers['x-api-key'];
   if (typeof xk === 'string' && xk.trim()) return xk.trim();
+  const goog = headers['x-goog-api-key'];
+  if (typeof goog === 'string' && goog.trim()) return goog.trim();
   return '';
 }
 
@@ -515,7 +519,7 @@ function readBody(req) {
 }
 
 // --- debug-body logging (config.debugBodies) ---
-const DEBUG_BODY_LIMIT = 16384;
+const DEBUG_BODY_LIMIT = 262144;
 function previewBody(buf) {
   if (buf == null || buf.length === 0) return '(empty)';
   const s = Buffer.isBuffer(buf) ? buf.toString('utf8') : String(buf);
@@ -1934,7 +1938,7 @@ function buildUpstreamHeaders(reqHeaders, host, route, key) {
 
   for (const k of Object.keys(out)) {
     const lower = k.toLowerCase();
-    if (lower === 'authorization' || lower === 'x-api-key') delete out[k];
+    if (lower === 'authorization' || lower === 'x-api-key' || lower === 'x-goog-api-key') delete out[k];
     if (lower === 'user-agent'
       && (route === 'openai' || route === 'openai-chat' || route === 'gemini')) delete out[k];
     if (lower === 'originator' && (route === 'openai' || route === 'openai-chat')) delete out[k];
